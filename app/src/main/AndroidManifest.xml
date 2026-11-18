@@ -2,6 +2,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Deliberately NO INTERNET permission: the keyboard cannot send anything anywhere. -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Optional runtime permission, requested only if the user taps Voice Input. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="false"

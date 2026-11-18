@@ -131,7 +131,7 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
         c.save()
         c.clipRect(side)
         text.textSize = 16 * sp
-        val fm = text.fontMetrics
+        val cellRect = RectF()
         sideItems.forEachIndexed { i, s ->
             val top = side.top + i * sideItemH - sideScroll
             if (top + sideItemH < side.top || top > side.bottom) return@forEachIndexed
@@ -139,14 +139,12 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
                 fill.color = theme.funcKeyPressed
                 c.drawRect(side.left, top, side.right, top + sideItemH, fill)
             }
-            text.color = theme.text
-            text.typeface = if (i == 0 && sideHighlightsFirst) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-            c.drawText(s, side.centerX(), top + sideItemH / 2 - (fm.ascent + fm.descent) / 2, text)
+            cellRect.set(side.left, top, side.right, top + sideItemH)
+            KeyDraw.drawKeyText(c, s, cellRect, 16 * sp, theme.text, text, dp, padH = 3 * dp, bold = i == 0 && sideHighlightsFirst)
             fill.color = theme.divider
             c.drawRect(side.left + 8 * dp, top + sideItemH - 0.5f * dp, side.right - 8 * dp, top + sideItemH, fill)
         }
         c.restore()
-        text.typeface = Typeface.DEFAULT
     }
 
     private fun drawButton(c: Canvas, b: Btn, pressed: Boolean) {
@@ -163,28 +161,18 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
         c.drawRoundRect(rc, radius, radius, fill)
         val fg = if (accent && !pressed) theme.accentText else theme.text
         val cx = rc.centerX(); val cy = rc.centerY()
+        val u = minOf(sp, dp * 1.12f)
         when (b.kind) {
             Kind.DIGIT -> {
-                label(c, b.digit.toString(), cx, rc.top + 11 * dp, 11 * sp, theme.textSecondary)
-                label(c, b.label, cx, cy + 3 * dp, 19 * sp, fg)
+                label(c, b.digit.toString(), cx, rc.top + 11 * dp, 11 * u, theme.textSecondary)
+                label(c, b.label, cx, cy + 3 * dp, 18.5f * u, fg)
             }
             Kind.DELETE -> drawDelete(c, cx, cy, 22 * dp, fg)
             Kind.EMOJI -> drawEmoji(c, cx, cy, 21 * dp, fg)
-            Kind.SPACE -> label(c, spaceLabel, cx, cy, 15.5f * sp, fg)
-            Kind.ENTER -> label(c, enterLabel, cx, cy, 15.5f * sp, fg)
-            Kind.LANG -> {
-                val dim = (fg and 0x00FFFFFF) or 0x66000000
-                text.textSize = 15.5f * sp
-                val wz = text.measureText("中"); val ws = text.measureText("/"); val we = text.measureText("英")
-                var x = cx - (wz + ws + we) / 2
-                text.textAlign = Paint.Align.LEFT
-                val fm = text.fontMetrics; val y = cy - (fm.ascent + fm.descent) / 2
-                text.color = if (chinese) fg else dim; c.drawText("中", x, y, text); x += wz
-                text.color = dim; c.drawText("/", x, y, text); x += ws
-                text.color = if (chinese) dim else fg; c.drawText("英", x, y, text)
-                text.textAlign = Paint.Align.CENTER
-            }
-            else -> label(c, b.label, cx, cy, 15.5f * sp, fg)
+            Kind.SPACE -> KeyDraw.drawKeyText(c, spaceLabel, rc, 15.0f * u, fg, text, dp)
+            Kind.ENTER -> KeyDraw.drawKeyText(c, enterLabel, rc, 15.0f * u, fg, text, dp, bold = accent)
+            Kind.LANG -> KeyDraw.drawLangBadge(c, rc, chinese, fg, text, dp, sp)
+            else -> KeyDraw.drawKeyText(c, b.label, rc, 15.0f * u, fg, text, dp, padH = 3.5f * dp)
         }
     }
 

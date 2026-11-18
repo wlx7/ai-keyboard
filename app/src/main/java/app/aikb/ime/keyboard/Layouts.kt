@@ -62,40 +62,40 @@ object Layouts {
     private val spacer = Key(KeyType.SPACER, width = 0.1f)
 
     private fun bottom(kind: BottomRow, chinese: Boolean, page: Page, spaceLabel: String? = null): Row {
-        val modeKey = if (page == Page.LETTERS) Key(KeyType.TO_SYMBOLS, "123", width = 1.25f)
-        else Key(KeyType.TO_LETTERS, if (chinese) (spaceLabel ?: "拼音") else "ABC", width = 1.25f)
-        val emoji = Key(KeyType.EMOJI, "emoji", width = 1.25f)
+        val modeKey = if (page == Page.LETTERS) Key(KeyType.TO_SYMBOLS, "123", width = 1.28f)
+        else Key(KeyType.TO_LETTERS, if (chinese) (spaceLabel ?: "拼音") else "ABC", width = 1.28f)
+        val emoji = Key(KeyType.EMOJI, "emoji", width = 1.12f)
         val enter = Key(KeyType.ENTER, "", width = if (kind == BottomRow.TEXT) 1.75f else 2.0f)
         if (kind == BottomRow.TEXT && chinese && page == Page.LETTERS) {
             // Chinese letters page: quick ，and 。 beside the space bar (long-press for ？！ etc.).
             return Row(listOf(
-                Key(KeyType.TO_SYMBOLS, "123", width = 1.1f),
-                Key(KeyType.EMOJI, "emoji", width = 1.1f),
+                Key(KeyType.TO_SYMBOLS, "123", width = 1.15f),
+                Key(KeyType.EMOJI, "emoji", width = 1.05f),
                 Key(KeyType.CHAR, "，", "，", 0.9f, listOf("、", "；", "：", ",")),
-                Key(KeyType.SPACE, spaceLabel ?: "空格", " ", 3.3f),
+                Key(KeyType.SPACE, spaceLabel ?: "空格", " ", 3.15f),
                 Key(KeyType.CHAR, "。", "。", 0.9f, listOf("？", "！", "…", ".")),
-                Key(KeyType.LANG, "中/英", width = 1.1f),
-                Key(KeyType.ENTER, "", width = 1.6f),
+                Key(KeyType.LANG, "中/英", width = 1.2f),
+                Key(KeyType.ENTER, "", width = 1.65f),
             ))
         }
         return when (kind) {
             BottomRow.TEXT -> Row(listOf(
                 modeKey, emoji,
-                Key(KeyType.SPACE, if (chinese) "空格" else "space", " ", 4.5f),
-                Key(KeyType.LANG, "中/英", width = 1.25f),
+                Key(KeyType.SPACE, if (chinese) "空格" else "space", " ", 4.55f),
+                Key(KeyType.LANG, "中/英", width = 1.3f),
                 enter,
             ))
             BottomRow.EMAIL -> Row(listOf(
                 modeKey, emoji,
-                Key(KeyType.SPACE, "space", " ", 3.0f),
+                Key(KeyType.SPACE, "space", " ", 3.1f),
                 Key(KeyType.CHAR, "@", "@", 1.25f),
                 Key(KeyType.CHAR, ".", ".", 1.25f, listOf("-", "_")),
                 enter,
             ))
             BottomRow.URL -> Row(listOf(
                 modeKey, emoji,
-                Key(KeyType.CHAR, ".", ".", 1.5f, listOf("-", "_", ":")),
-                Key(KeyType.CHAR, "/", "/", 1.5f, listOf("?", "=", "&", "#")),
+                Key(KeyType.CHAR, ".", ".", 1.55f, listOf("-", "_", ":")),
+                Key(KeyType.CHAR, "/", "/", 1.55f, listOf("?", "=", "&", "#")),
                 Key(KeyType.TEXT, ".com", ".com", 2.0f, listOf(".cn", ".net", ".org", ".com.cn", ".io")),
                 Key(KeyType.ENTER, "", width = 2.5f),
             ))

@@ -139,22 +139,24 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         val fg = if (accentEnter && !pressed) theme.accentText else theme.text
         val cx = rc.centerX()
         val cy = rc.centerY()
+        val u = minOf(sp, dp * 1.12f)
         when (key.type) {
             KeyType.SHIFT -> drawShift(c, cx, cy, 20 * dp, fg)
             KeyType.DELETE -> drawDelete(c, cx, cy, 22 * dp, fg, pressed)
             KeyType.EMOJI -> drawEmoji(c, cx, cy, 21 * dp, fg)
-            KeyType.LANG -> drawLang(c, cx, cy, fg)
-            KeyType.ENTER -> drawLabel(c, enterLabel, cx, cy, 15.5f * sp, fg)
-            KeyType.SPACE -> drawLabel(c, key.label, cx, cy, 15.5f * sp, fg)
-            KeyType.TO_SYMBOLS, KeyType.TO_SYMBOLS2, KeyType.TO_LETTERS -> drawLabel(c, key.label, cx, cy, 15.5f * sp, fg)
-            KeyType.TEXT -> drawLabel(c, key.label, cx, cy, 16 * sp, fg)
+            KeyType.LANG -> KeyDraw.drawLangBadge(c, rc, chinese, fg, text, dp, sp)
+            KeyType.ENTER -> KeyDraw.drawKeyText(c, enterLabel, rc, 15.2f * u, fg, text, dp, padH = 4 * dp, bold = accentEnter)
+            KeyType.SPACE -> KeyDraw.drawKeyText(c, key.label, rc, 15.0f * u, fg, text, dp)
+            KeyType.TO_SYMBOLS, KeyType.TO_SYMBOLS2, KeyType.TO_LETTERS ->
+                KeyDraw.drawKeyText(c, key.label, rc, 15.0f * u, fg, text, dp, padH = 3.5f * dp)
+            KeyType.TEXT -> KeyDraw.drawKeyText(c, key.label, rc, 15.5f * u, fg, text, dp, padH = 3.5f * dp)
             KeyType.CHAR -> {
                 val label = displayLabel(key)
-                val size = if (key.isLetter) 23.5f * sp else if (label.length > 1) 16 * sp else 22 * sp
-                drawLabel(c, label, cx, cy, size, fg)
+                val size = if (key.isLetter) 23.0f * u else if (label.length > 1) 15.5f * u else 21.5f * u
+                KeyDraw.drawKeyText(c, label, rc, size, fg, text, dp, padH = 2.5f * dp)
                 if (key.isLetter) hints[key.label[0]]?.let { h ->
                     text.textAlign = Paint.Align.RIGHT
-                    drawLabel(c, h, rc.right - 4 * dp, rc.top + 9 * dp, 10.5f * sp, theme.textSecondary)
+                    drawLabel(c, h, rc.right - 3.5f * dp, rc.top + 8.5f * dp, 10.0f * u, theme.textSecondary)
                     text.textAlign = Paint.Align.CENTER
                 }
             }
@@ -222,21 +224,6 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         c.drawCircle(cx - 0.17f * s, cy - 0.1f * s, 0.06f * s, fill)
         c.drawCircle(cx + 0.17f * s, cy - 0.1f * s, 0.06f * s, fill)
         c.drawArc(cx - 0.25f * s, cy - 0.15f * s, cx + 0.25f * s, cy + 0.28f * s, 20f, 140f, false, stroke)
-    }
-
-    private fun drawLang(c: Canvas, cx: Float, cy: Float, color: Int) {
-        text.textSize = 15.5f * sp
-        val fm = text.fontMetrics
-        val y = cy - (fm.ascent + fm.descent) / 2
-        val zh = "中"; val sep = "/"; val en = "英"
-        val wz = text.measureText(zh); val ws = text.measureText(sep); val we = text.measureText(en)
-        var x = cx - (wz + ws + we) / 2
-        val dim = (color and 0x00FFFFFF) or 0x66000000
-        text.textAlign = Paint.Align.LEFT
-        text.color = if (chinese) color else dim; c.drawText(zh, x, y, text); x += wz
-        text.color = dim; c.drawText(sep, x, y, text); x += ws
-        text.color = if (chinese) dim else color; c.drawText(en, x, y, text)
-        text.textAlign = Paint.Align.CENTER
     }
 
     // ---------------------------------------------------------------- touch

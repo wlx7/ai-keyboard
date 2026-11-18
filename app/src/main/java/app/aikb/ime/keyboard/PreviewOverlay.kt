@@ -110,10 +110,8 @@ class PreviewOverlay(context: Context) : View(context) {
         c.save(); c.translate(0f, 1.5f * dp); c.drawPath(path, fill); c.restore()
         fill.color = theme.popup
         c.drawPath(path, fill)
-        text.color = theme.text
-        text.textSize = 32 * sp
-        val fm = text.fontMetrics
-        c.drawText(label, left + bw / 2, top + bh / 2 - (fm.ascent + fm.descent) / 2, text)
+        val balloonRect = RectF(left, top, left + bw, top + bh)
+        KeyDraw.drawKeyText(c, label, balloonRect, 32 * sp, theme.text, text, dp, padH = 4 * dp)
     }
 
     private fun drawAlts(c: Canvas) {
@@ -122,17 +120,15 @@ class PreviewOverlay(context: Context) : View(context) {
         c.drawRoundRect(altsRect.left, altsRect.top + 1.5f * dp, altsRect.right, altsRect.bottom + 1.5f * dp, r, r, fill)
         fill.color = theme.popup
         c.drawRoundRect(altsRect, r, r, fill)
-        text.textSize = 22 * sp
-        val fm = text.fontMetrics
         alts.forEachIndexed { i, s ->
             val l = altsRect.left + 4 * dp + i * altCell
             val cell = RectF(l + 2 * dp, altsRect.top + 5 * dp, l + altCell - 2 * dp, altsRect.bottom - 5 * dp)
-            if (i == altSel) {
+            val fg = if (i == altSel) {
                 fill.color = theme.accent
                 c.drawRoundRect(cell, 6 * dp, 6 * dp, fill)
-                text.color = theme.accentText
-            } else text.color = theme.text
-            c.drawText(s, cell.centerX(), cell.centerY() - (fm.ascent + fm.descent) / 2, text)
+                theme.accentText
+            } else theme.text
+            KeyDraw.drawKeyText(c, s, cell, 22 * sp, fg, text, dp, padH = 2 * dp)
         }
     }
 }

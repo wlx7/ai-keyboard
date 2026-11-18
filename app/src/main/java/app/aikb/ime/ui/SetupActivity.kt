@@ -37,10 +37,33 @@ class SetupActivity : ComponentActivity() {
     private var enabled by mutableStateOf(false)
     private var selected by mutableStateOf(false)
 
+    private val micPermissionLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (intent?.getBooleanExtra(EXTRA_REQUEST_MIC, false) == true && granted) {
+            finish()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent { AppTheme { Screen() } }
+        if (intent?.getBooleanExtra(EXTRA_REQUEST_MIC, false) == true) {
+            micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_REQUEST_MIC, false)) {
+            micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    companion object {
+        const val EXTRA_REQUEST_MIC = "request_mic"
     }
 
     override fun onResume() {
@@ -274,7 +297,11 @@ private fun AiSection(prefs: android.content.SharedPreferences) {
                     require(String(head, Charsets.US_ASCII) == "GGUF") { "不是 GGUF 模型文件" }
                     tmp.outputStream().use { stream.copyTo(it, 1 shl 20) }
                 }
-                check(tmp.renameTo(file)) { "保存失败" }
+                java.nio.file.Files.move(
+                    tmp.toPath(),
+                    file.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
                 file.length()
             }
             android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -305,8 +332,8 @@ private fun AiSection(prefs: android.content.SharedPreferences) {
     }
     Text(
         (status?.let { "$it。" } ?: "") +
-            "模型在手机上运行，只在你停顿时为较长的拼音挑选更合理的整句，并按你的选择自动调整。" +
-            "应用不联网，请把模型文件（推荐 Qwen3-0.6B-Base Q4_K_M，约 400 MB）拷到手机后在此导入。",
+            "模型在手机本地运行，只在停顿时为长拼音挑选更合理的整句，并按你的选择自动微调权重。" +
+            "应用不联网，请将模型文件（推荐专属蒸馏版 zh-lm-lingxi-285m-q4_0.gguf 约 155 MB，或轻量版 47 MB / 千问原版 397 MB）拷到手机后在此导入。",
         fontSize = 13.sp, color = Secondary(), modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp),
     )
 }

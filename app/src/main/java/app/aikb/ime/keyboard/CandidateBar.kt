@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
@@ -14,19 +15,45 @@ import android.widget.OverScroller
 import kotlin.math.abs
 
 /**
- * Horizontal candidate strip.
- *
- * Every visible candidate must be tappable regardless of count (CyIME regression: with exactly
- * two English candidates the second one ignored taps). Hit-test rects are therefore rebuilt
- * whenever items or size change, and taps are resolved against content coordinates
- * (x + scroll) so nothing depends on stale layout.
+ * Top 44dp strip of the keyboard:
+ *   - While typing / showing candidates: horizontal scrollable candidate strip.
+ *     Every visible candidate is tappable regardless of count (see CandidateLayoutTest).
+ *   - When idle (no candidates): clean WeChat-Keyboard-inspired minimal toolbar:
+ *     `[⊞ Menu]`  `[✍ Handwriting / ⌨ Keyboard]`  `[📋 Clipboard / Fresh Paste Chip]` ... `[🎤 Voice]`  `[⌄ Hide]`
+ *   - During passive English next-word suggestions (`pinnedToolbar = true`): keeps `[⊞]` on the
+ *     left and `[⌄]` on the right so tools & collapse remain one tap away.
  */
 @SuppressLint("ViewConstructor")
 class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(context) {
+
+    enum class ToolbarAction { MENU, HANDWRITING_TOGGLE, CLIPBOARD, PASTE_FRESH, DISMISS_FRESH, VOICE, HIDE }
+
     private val dp = resources.displayMetrics.density
     private val sp = resources.displayMetrics.scaledDensity
     var theme: KbTheme = KbTheme.of(context)
         set(v) { field = v; invalidate() }
+
+    var onToolbarAction: ((ToolbarAction) -> Unit)? = null
+
+    /** True when the `[⊞]` feature drawer (or clipboard/voice sub-panel) is open. */
+    var menuActive = false
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    /** True when currently in handwriting mode (switches the quick icon between ✍ and ⌨). */
+    var handwritingActive = false
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    /** Shows a subtle accent dot on the clipboard icon when non-expired clips exist. */
+    var hasClips = false
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    /** Freshly copied text (< 60s) shown as a one-tap paste chip when idle. */
+    var freshClip: String? = null
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    /** Keeps `[⊞]` (left) and `[⌄]` (right) pinned alongside passive next-word predictions. */
+    var pinnedToolbar = false
+        set(v) { if (field != v) { field = v; relayout(); invalidate() } }
 
     private var items: List<String> = emptyList()
     private var highlight = -1
@@ -37,6 +64,10 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+    }
+    private val path = Path()
     private val scroller = OverScroller(context)
     private var velocity: VelocityTracker? = null
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
@@ -50,9 +81,10 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), (44 * dp).toInt())
     }
 
-    fun setItems(list: List<String>, highlightIndex: Int) {
+    fun setItems(list: List<String>, highlightIndex: Int, keepToolbarEdges: Boolean = false) {
         items = list
         highlight = highlightIndex
+        pinnedToolbar = keepToolbarEdges && list.isNotEmpty()
         scroll = 0f
         scroller.forceFinished(true)
         pressedIndex = -1
@@ -68,15 +100,45 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     var expanded = false
         set(v) { field = v; invalidate() }
     var onExpandToggle: (() -> Unit)? = null
-    private val buttonW get() = 46 * dp
-    private val stripW: Float get() = if (expandable) width - buttonW else width.toFloat()
-    private var buttonDown = false
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = relayout()
+    private val buttonW get() = 44 * dp
+    private val stripLeft: Float get() = if (items.isNotEmpty() && pinnedToolbar) buttonW else 0f
+    private val stripRight: Float
+        get() = when {
+            items.isNotEmpty() && (expandable || pinnedToolbar) -> width - buttonW
+            else -> width.toFloat()
+        }
+    private val stripW: Float get() = (stripRight - stripLeft).coerceAtLeast(0f)
+
+    private var rightButtonDown = false
+    private var leftMenuDown = false
+    private var pressedToolbar: ToolbarAction? = null
+
+    // Idle toolbar hit rects
+    private val menuRect = RectF()
+    private val hwRect = RectF()
+    private val clipRect = RectF()
+    private val freshPasteRect = RectF()
+    private val freshCloseRect = RectF()
+    private val voiceRect = RectF()
+    private val hideRect = RectF()
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        updateToolbarRects(w.toFloat(), h.toFloat())
+        relayout()
+    }
+
+    private fun updateToolbarRects(w: Float, h: Float) {
+        menuRect.set(4 * dp, 4 * dp, 44 * dp, h - 4 * dp)
+        hwRect.set(48 * dp, 4 * dp, 90 * dp, h - 4 * dp)
+        clipRect.set(94 * dp, 4 * dp, 136 * dp, h - 4 * dp)
+        hideRect.set(w - 44 * dp, 4 * dp, w - 4 * dp, h - 4 * dp)
+        voiceRect.set(w - 88 * dp, 4 * dp, w - 46 * dp, h - 4 * dp)
+    }
 
     private fun relayout() {
         val w = stripW
-        if (w <= 0f) { rects = emptyList(); return }
+        if (w <= 0f || items.isEmpty()) { rects = emptyList(); spans = emptyList(); contentWidth = 0f; return }
         paint.textSize = textSize
         val pad = 14 * dp
         val widths = items.map { maxOf(paint.measureText(it) + 2 * pad, 52 * dp) }
@@ -89,7 +151,7 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
     private fun maxScroll() = maxOf(0f, contentWidth - stripW)
 
-    private fun indexAt(x: Float): Int = CandidateLayout.indexAt(spans, x + scroll)
+    private fun indexAt(x: Float): Int = CandidateLayout.indexAt(spans, x - stripLeft + scroll)
 
     override fun computeScroll() {
         if (scroller.computeScrollOffset()) {
@@ -100,14 +162,28 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(theme.background)
-        if (items.isEmpty()) return
+        // Subtle top border separating keyboard from editor
+        fill.color = theme.divider
+        canvas.drawRect(0f, 0f, width.toFloat(), 0.5f * dp, fill)
+
+        if (items.isEmpty()) {
+            drawToolbar(canvas)
+            return
+        }
+
+        if (pinnedToolbar) {
+            drawPinnedMenuIcon(canvas)
+            drawRightActionButton(canvas, isHide = true)
+        } else if (expandable) {
+            drawRightActionButton(canvas, isHide = false)
+        }
+
         paint.textSize = textSize
         val fm = paint.fontMetrics
         val baseline = height / 2f - (fm.ascent + fm.descent) / 2
-        if (expandable) drawExpandButton(canvas)
         canvas.save()
-        canvas.clipRect(0f, 0f, stripW, height.toFloat())
-        canvas.translate(-scroll, 0f)
+        canvas.clipRect(stripLeft, 0f, stripRight, height.toFloat())
+        canvas.translate(stripLeft - scroll, 0f)
         for (i in items.indices) {
             val r = rects.getOrNull(i) ?: continue
             if (r.right < scroll || r.left > scroll + stripW) continue
@@ -129,44 +205,199 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         canvas.restore()
     }
 
-    private fun drawExpandButton(c: Canvas) {
-        val x0 = stripW
+    private fun drawToolbar(c: Canvas) {
+        updateToolbarRects(width.toFloat(), height.toFloat())
+        val cy = height / 2f
+
+        // 1) Left `[⊞]` WeChat-style panel toggle button
+        val menuBg = when {
+            menuActive -> theme.accent
+            pressedToolbar == ToolbarAction.MENU -> theme.keyPressed
+            else -> (theme.funcKey and 0x00FFFFFF) or 0x66000000
+        }
+        fill.color = menuBg
+        c.drawRoundRect(menuRect.left + 2 * dp, 6 * dp, menuRect.right - 2 * dp, height - 6 * dp, 9 * dp, 9 * dp, fill)
+        val menuFg = if (menuActive) theme.accentText else theme.text
+        KeyDraw.drawGridIcon(c, menuRect.centerX(), cy, 18.5f * dp, menuFg, fill, stroke, dp, active = menuActive)
+
+        // 2) Fresh clipboard paste pill OR clean Handwriting + Clipboard quick icons
+        val fresh = freshClip
+        if (fresh != null) {
+            val maxChipRight = voiceRect.left - 6 * dp
+            val preview = "粘贴: " + fresh.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
+            val u = minOf(sp, dp * 1.12f)
+            paint.typeface = Typeface.DEFAULT
+            paint.textSize = 13 * u
+            val availTextW = (maxChipRight - hwRect.left - 38 * dp).coerceAtLeast(36 * dp)
+            val shown = ellipsize(preview, availTextW)
+            val chipW = (paint.measureText(shown) + 38 * dp).coerceAtMost(maxChipRight - hwRect.left)
+            freshPasteRect.set(hwRect.left, 6 * dp, hwRect.left + chipW, height - 6 * dp)
+            freshCloseRect.set(freshPasteRect.right - 26 * dp, 6 * dp, freshPasteRect.right, height - 6 * dp)
+
+            fill.color = if (pressedToolbar == ToolbarAction.PASTE_FRESH) theme.keyPressed else theme.candidateHighlight
+            c.drawRoundRect(freshPasteRect, 16 * dp, 16 * dp, fill)
+            paint.color = theme.text
+            paint.textAlign = Paint.Align.LEFT
+            val fm = paint.fontMetrics
+            c.drawText(shown, freshPasteRect.left + 11 * dp, cy - (fm.ascent + fm.descent) / 2f, paint)
+            paint.textAlign = Paint.Align.CENTER
+
+            // Dismiss '×' inside right end of chip
+            val xcx = freshCloseRect.centerX()
+            val xr = 4 * dp
+            stroke.color = theme.textSecondary
+            stroke.strokeWidth = 1.4f * dp
+            c.drawLine(xcx - xr, cy - xr, xcx + xr, cy + xr, stroke)
+            c.drawLine(xcx - xr, cy + xr, xcx + xr, cy - xr, stroke)
+        } else {
+            freshPasteRect.setEmpty()
+            freshCloseRect.setEmpty()
+
+            // Quick Handwriting / Keyboard toggle
+            if (pressedToolbar == ToolbarAction.HANDWRITING_TOGGLE || handwritingActive) {
+                fill.color = if (handwritingActive) (theme.accent and 0x00FFFFFF) or 0x24000000 else theme.keyPressed
+                c.drawRoundRect(hwRect, 8 * dp, 8 * dp, fill)
+            }
+            val hwColor = if (handwritingActive) theme.accent else theme.text
+            if (handwritingActive) {
+                KeyDraw.drawKeyboardIcon(c, hwRect.centerX(), cy, 20 * dp, hwColor, fill, stroke, dp)
+            } else {
+                KeyDraw.drawHandwritingIcon(c, hwRect.centerX(), cy, 19 * dp, hwColor, stroke, path, dp)
+            }
+
+            // Clipboard icon (+ small dot when items exist)
+            if (pressedToolbar == ToolbarAction.CLIPBOARD) {
+                fill.color = theme.keyPressed
+                c.drawRoundRect(clipRect, 8 * dp, 8 * dp, fill)
+            }
+            KeyDraw.drawClipboardIcon(c, clipRect.centerX(), cy, 19 * dp, theme.text, stroke, dp)
+            if (hasClips) {
+                fill.color = theme.accent
+                c.drawCircle(clipRect.centerX() + 7.5f * dp, cy - 7.5f * dp, 2.6f * dp, fill)
+            }
+        }
+
+        // 3) Right Voice icon + Collapse chevron
+        if (pressedToolbar == ToolbarAction.VOICE) {
+            fill.color = theme.keyPressed
+            c.drawRoundRect(voiceRect, 8 * dp, 8 * dp, fill)
+        }
+        KeyDraw.drawMicIcon(c, voiceRect.centerX(), cy, 19 * dp, theme.text, stroke, dp)
+
+        if (pressedToolbar == ToolbarAction.HIDE) {
+            fill.color = theme.keyPressed
+            c.drawRoundRect(hideRect, 8 * dp, 8 * dp, fill)
+        }
+        KeyDraw.drawChevron(c, hideRect.centerX(), cy, 6 * dp, 1, theme.text, stroke, dp)
+    }
+
+    private fun drawPinnedMenuIcon(c: Canvas) {
+        val cy = height / 2f
+        if (leftMenuDown || menuActive) {
+            fill.color = if (menuActive) theme.accent else theme.keyPressed
+            c.drawRoundRect(4 * dp, 6 * dp, buttonW - 4 * dp, height - 6 * dp, 8 * dp, 8 * dp, fill)
+        }
+        val fg = if (menuActive) theme.accentText else theme.text
+        KeyDraw.drawGridIcon(c, buttonW / 2f, cy, 17.5f * dp, fg, fill, stroke, dp, active = menuActive)
+        fill.color = theme.divider
+        c.drawRect(buttonW - 0.6f * dp, 10 * dp, buttonW, height - 10 * dp, fill)
+    }
+
+    private fun drawRightActionButton(c: Canvas, isHide: Boolean) {
+        val x0 = width - buttonW
         fill.color = theme.divider
         c.drawRect(x0, 10 * dp, x0 + 0.7f * dp, height - 10 * dp, fill)
-        if (buttonDown) {
+        if (rightButtonDown) {
             fill.color = theme.keyPressed
             c.drawRoundRect(x0 + 4 * dp, 5 * dp, width - 4 * dp, height - 5 * dp, 8 * dp, 8 * dp, fill)
         }
         val cx = x0 + buttonW / 2
         val cy = height / 2f
-        val s = 6 * dp
-        val dir = if (expanded) -1 else 1 // chevron points down to open, up to close
-        fill.color = theme.text
-        fill.strokeWidth = 2 * dp
-        fill.strokeCap = Paint.Cap.ROUND
-        c.drawLine(cx - s, cy - dir * s / 2, cx, cy + dir * s / 2, fill)
-        c.drawLine(cx, cy + dir * s / 2, cx + s, cy - dir * s / 2, fill)
+        val dir = if (!isHide && expanded) -1 else 1
+        KeyDraw.drawChevron(c, cx, cy, 6 * dp, dir, theme.text, stroke, dp)
     }
 
     private fun ellipsize(s: String, maxW: Float): String {
+        if (paint.measureText(s) <= maxW) return s
         var end = s.length
         while (end > 1 && paint.measureText(s, 0, end) + paint.measureText("…") > maxW) end--
         return s.substring(0, end) + "…"
     }
 
+    private fun toolbarHit(x: Float, y: Float): ToolbarAction? {
+        if (menuRect.contains(x, y)) return ToolbarAction.MENU
+        if (freshClip != null) {
+            if (freshCloseRect.contains(x, y)) return ToolbarAction.DISMISS_FRESH
+            if (freshPasteRect.contains(x, y)) return ToolbarAction.PASTE_FRESH
+        } else {
+            if (hwRect.contains(x, y)) return ToolbarAction.HANDWRITING_TOGGLE
+            if (clipRect.contains(x, y)) return ToolbarAction.CLIPBOARD
+        }
+        if (voiceRect.contains(x, y)) return ToolbarAction.VOICE
+        if (hideRect.contains(x, y)) return ToolbarAction.HIDE
+        return null
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
-        if (velocity == null) velocity = VelocityTracker.obtain()
-        velocity!!.addMovement(e)
-        if (expandable && (buttonDown || (e.actionMasked == MotionEvent.ACTION_DOWN && e.x >= stripW))) {
+        // 1) Idle toolbar mode
+        if (items.isEmpty()) {
             when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> buttonDown = true
-                MotionEvent.ACTION_UP -> { buttonDown = false; if (e.x >= stripW - 8 * dp) onExpandToggle?.invoke() }
-                MotionEvent.ACTION_CANCEL -> buttonDown = false
+                MotionEvent.ACTION_DOWN -> {
+                    pressedToolbar = toolbarHit(e.x, e.y)
+                    invalidate()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (toolbarHit(e.x, e.y) != pressedToolbar) {
+                        pressedToolbar = null
+                        invalidate()
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    val act = toolbarHit(e.x, e.y)
+                    if (act != null && act == pressedToolbar) onToolbarAction?.invoke(act)
+                    pressedToolbar = null
+                    invalidate()
+                }
+                MotionEvent.ACTION_CANCEL -> { pressedToolbar = null; invalidate() }
+            }
+            return true
+        }
+
+        // 2) Left pinned `[⊞]` button when passive next-word predictions are shown
+        if (pinnedToolbar && (leftMenuDown || (e.actionMasked == MotionEvent.ACTION_DOWN && e.x < stripLeft))) {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> leftMenuDown = true
+                MotionEvent.ACTION_UP -> {
+                    leftMenuDown = false
+                    if (e.x < stripLeft + 8 * dp) onToolbarAction?.invoke(ToolbarAction.MENU)
+                }
+                MotionEvent.ACTION_CANCEL -> leftMenuDown = false
             }
             invalidate()
             return true
         }
+
+        // 3) Right button (Chinese expand chevron OR pinned hide chevron)
+        if ((expandable || pinnedToolbar) && (rightButtonDown || (e.actionMasked == MotionEvent.ACTION_DOWN && e.x >= stripRight))) {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> rightButtonDown = true
+                MotionEvent.ACTION_UP -> {
+                    rightButtonDown = false
+                    if (e.x >= stripRight - 8 * dp) {
+                        if (expandable) onExpandToggle?.invoke()
+                        else onToolbarAction?.invoke(ToolbarAction.HIDE)
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> rightButtonDown = false
+            }
+            invalidate()
+            return true
+        }
+
+        // 4) Scrollable candidate strip
+        if (velocity == null) velocity = VelocityTracker.obtain()
+        velocity!!.addMovement(e)
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 scroller.forceFinished(true)

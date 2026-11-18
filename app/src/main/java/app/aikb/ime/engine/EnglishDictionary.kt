@@ -8,19 +8,43 @@ import java.nio.channels.FileChannel
 
 /**
  * Read-only view over assets/dict/en.dict (built by tools/BuildEnglishDict.java).
+ * Supports AIKBEN02 (unigrams + memory-mapped bigram graph) and legacy AIKBEN01.
  * The asset is stored uncompressed so it can be memory-mapped: no heap copy, near-zero load time.
  */
 class EnglishDictionary private constructor(private val buf: ByteBuffer) {
     val size: Int
-    private val offsetsStart = 12
+    private val offsetsStart: Int
     private val dataStart: Int
+    private val bigramHeadCount: Int
+    private val bigramHeadsStart: Int
+    private val bigramEdgeStartTable: Int
+    private val bigramEdgesDataStart: Int
 
     init {
         buf.order(ByteOrder.BIG_ENDIAN)
-        val magic = bytes(0, 8)
-        require(String(magic, Charsets.US_ASCII) == "AIKBEN01") { "bad en.dict" }
-        size = buf.getInt(8)
-        dataStart = offsetsStart + size * 4
+        val magic = String(bytes(0, 8), Charsets.US_ASCII)
+        when (magic) {
+            "AIKBEN02" -> {
+                size = buf.getInt(8)
+                bigramHeadCount = buf.getInt(12)
+                val biStart = buf.getInt(16)
+                offsetsStart = 20
+                dataStart = offsetsStart + size * 4
+                bigramHeadsStart = biStart
+                bigramEdgeStartTable = biStart + bigramHeadCount * 4
+                bigramEdgesDataStart = bigramEdgeStartTable + (bigramHeadCount + 1) * 4
+            }
+            "AIKBEN01" -> {
+                size = buf.getInt(8)
+                offsetsStart = 12
+                dataStart = offsetsStart + size * 4
+                bigramHeadCount = 0
+                bigramHeadsStart = 0
+                bigramEdgeStartTable = 0
+                bigramEdgesDataStart = 0
+            }
+            else -> error("bad en.dict magic: $magic")
+        }
     }
 
     private fun bytes(at: Int, len: Int): ByteArray = ByteArray(len) { buf.get(at + it) }
@@ -74,7 +98,7 @@ class EnglishDictionary private constructor(private val buf: ByteBuffer) {
         val from = lowerBound(k, true)
         var lo = from
         var hi = size
-        while (lo < hi) { // first index past the prefix block
+        while (lo < hi) {
             val mid = (lo + hi) ushr 1
             if (compare(mid, k, true) <= 0) lo = mid + 1 else hi = mid
         }
@@ -90,7 +114,56 @@ class EnglishDictionary private constructor(private val buf: ByteBuffer) {
         return from until to
     }
 
+    /** Canonical unigram index matching [word] (distinguishing e.g. "its" vs "it's"), or -1. */
+    fun unigramIndexOf(word: String): Int {
+        val clean = word.trim().replace('’', '\'')
+        val alpha = clean.lowercase().filter { it in 'a'..'z' }
+        if (alpha.isEmpty()) return -1
+        val range = exactRange(alpha)
+        var fallback = -1
+        for (i in range) {
+            val d = display(i)
+            val dAlpha = d.lowercase().filter { it in 'a'..'z' }
+            if (dAlpha != alpha) continue // skip misspelling aliases
+            if (d.equals(clean, ignoreCase = true)) return i
+            if (fallback < 0) fallback = i
+        }
+        return fallback
+    }
+
+    /**
+     * Packed bigram edges `(targetUnigramIdx shl 8) or score` following [prevWord].
+     * Sorted by descending conditional score (1..255). Empty when unseen.
+     */
+    fun bigrams(prevWord: String?): IntArray {
+        if (bigramHeadCount == 0 || prevWord.isNullOrBlank()) return EMPTY_INTS
+        val headIdx = unigramIndexOf(prevWord)
+        if (headIdx < 0) return EMPTY_INTS
+        var lo = 0
+        var hi = bigramHeadCount - 1
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            val v = buf.getInt(bigramHeadsStart + mid * 4)
+            when {
+                v < headIdx -> lo = mid + 1
+                v > headIdx -> hi = mid - 1
+                else -> {
+                    val e0 = buf.getInt(bigramEdgeStartTable + mid * 4)
+                    val e1 = buf.getInt(bigramEdgeStartTable + (mid + 1) * 4)
+                    val n = (e1 - e0).coerceAtLeast(0)
+                    return IntArray(n) { buf.getInt(bigramEdgesDataStart + (e0 + it) * 4) }
+                }
+            }
+        }
+        return EMPTY_INTS
+    }
+
     companion object {
+        private val EMPTY_INTS = IntArray(0)
+
+        fun edgeTarget(packed: Int): Int = packed ushr 8
+        fun edgeScore(packed: Int): Int = packed and 0xFF
+
         /** For tests and tools: wrap an already-loaded buffer. */
         fun fromBuffer(buffer: ByteBuffer): EnglishDictionary = EnglishDictionary(buffer)
 

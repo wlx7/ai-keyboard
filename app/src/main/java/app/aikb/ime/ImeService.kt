@@ -1,10 +1,15 @@
 package app.aikb.ime
 
+import android.content.ClipDescription
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.inputmethodservice.InputMethodService
 import android.media.AudioManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
@@ -15,16 +20,21 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.ClipboardStore
 import app.aikb.ime.engine.EnglishDictionary
 import app.aikb.ime.engine.EnglishEngine
 import app.aikb.ime.engine.EnglishResult
-import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.HandwritingEngine
 import app.aikb.ime.engine.Rime
 import app.aikb.ime.engine.RimeEngine
+import app.aikb.ime.engine.T9
 import app.aikb.ime.engine.UserHistory
 import app.aikb.ime.keyboard.CandidateBar
 import app.aikb.ime.keyboard.CandidatePanel
+import app.aikb.ime.keyboard.ClipboardPanel
 import app.aikb.ime.keyboard.EmojiPanel
+import app.aikb.ime.keyboard.HandwritingView
 import app.aikb.ime.keyboard.KbTheme
 import app.aikb.ime.keyboard.Key
 import app.aikb.ime.keyboard.KeyType
@@ -35,12 +45,25 @@ import app.aikb.ime.keyboard.Page
 import app.aikb.ime.keyboard.PreviewOverlay
 import app.aikb.ime.keyboard.ShiftState
 import app.aikb.ime.keyboard.T9View
-import app.aikb.ime.engine.T9
+import app.aikb.ime.keyboard.ToolPanel
+import app.aikb.ime.keyboard.VoicePanel
+import app.aikb.ime.ui.SetupActivity
 
-class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Listener, T9View.Listener {
+class ImeService : InputMethodService(),
+    KeyboardView.Listener,
+    EmojiPanel.Listener,
+    T9View.Listener,
+    HandwritingView.Listener,
+    ToolPanel.Listener,
+    ClipboardPanel.Listener,
+    VoicePanel.Listener {
+
+    private enum class Overlay { NONE, EMOJI, CANDIDATES, TOOLS, CLIPBOARD, VOICE }
 
     private lateinit var prefs: SharedPreferences
     private lateinit var history: UserHistory
+    private lateinit var clipboardStore: ClipboardStore
+    private var sysClipboard: ClipboardManager? = null
     private var english: EnglishEngine? = null
 
     private lateinit var root: FrameLayout
@@ -48,18 +71,31 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     private lateinit var candidates: CandidateBar
     private lateinit var emoji: EmojiPanel
     private lateinit var candidatePanel: CandidatePanel
+    private lateinit var toolPanel: ToolPanel
+    private lateinit var clipboardPanel: ClipboardPanel
+    private lateinit var voicePanel: VoicePanel
     private lateinit var t9: T9View
+    private lateinit var handwriting: HandwritingView
     private lateinit var previewOverlay: PreviewOverlay
 
+    private var overlay = Overlay.NONE
+    private var handwritingMode = false
+    private var hwCandidates: List<String> = emptyList()
+    private val hwComposing: Boolean get() = handwritingMode && hwCandidates.isNotEmpty()
+    private val hwGen = java.util.concurrent.atomic.AtomicLong()
+    private val hwWorker = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "hw").apply { priority = Thread.NORM_PRIORITY }
+    }
     private var scene = Scene.of(null)
     private var page = Page.LETTERS
     private var chinese = false
     private var shift = ShiftState.OFF
     private var lastShiftTap = 0L
 
-    /** Word being typed (English) or pinyin being typed (Chinese), shown as composing text. */
+    /** Word being typed (English) or fallback pinyin being typed, shown as composing text. */
     private val composing = StringBuilder()
     private var result: EnglishResult? = null
+    private var showNextPredictions = false
     private var shownCandidates: List<String> = emptyList()
     /** What each candidate commits (may differ from its label, e.g. quoted literal or domain tail). */
     private var candidateCommits: List<String> = emptyList()
@@ -79,10 +115,39 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     private var haptics = true
     private var sound = false
 
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val clipTick = object : Runnable {
+        override fun run() {
+            syncToolbarState()
+            uiHandler.postDelayed(this, 15_000L)
+        }
+    }
+
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        val cm = sysClipboard ?: return@OnPrimaryClipChangedListener
+        val clip = runCatching { cm.primaryClip }.getOrNull() ?: return@OnPrimaryClipChangedListener
+        val desc = clip.description
+        if (Build.VERSION.SDK_INT >= 33 && desc?.extras?.getBoolean(ClipDescription.EXTRA_IS_SENSITIVE) == true) {
+            return@OnPrimaryClipChangedListener
+        }
+        if (clip.itemCount > 0) {
+            val txt = clip.getItemAt(0).text?.toString()
+            if (!txt.isNullOrBlank()) {
+                clipboardStore.onCopied(txt)
+                if (::clipboardPanel.isInitialized && overlay == Overlay.CLIPBOARD) clipboardPanel.refresh()
+                syncToolbarState()
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         history = UserHistory(filesDir.resolve("en_user.tsv"))
+        clipboardStore = ClipboardStore(filesDir.resolve("clipboard_pinned.txt"))
+        sysClipboard = (getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager)?.also {
+            runCatching { it.addPrimaryClipChangedListener(clipListener) }
+        }
         english = runCatching { EnglishEngine(EnglishDictionary.load(this), history) }.getOrNull()
         RimeEngine.addStateListener(rimeListener)
         RimeEngine.traditional = prefs.getBoolean(KEY_TRADITIONAL, false)
@@ -91,8 +156,11 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     }
 
     override fun onDestroy() {
+        uiHandler.removeCallbacks(clipTick)
+        runCatching { sysClipboard?.removePrimaryClipChangedListener(clipListener) }
         RimeEngine.removeStateListener(rimeListener)
         aiWorker.shutdownNow()
+        hwWorker.shutdownNow()
         super.onDestroy()
     }
 
@@ -100,17 +168,27 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         val theme = KbTheme.of(this)
         previewOverlay = PreviewOverlay(this)
         keyboard = KeyboardView(this, this).also { it.previewOverlay = previewOverlay }
-        candidates = CandidateBar(this) { pickCandidate(it) }
+        candidates = CandidateBar(this) { pickCandidate(it) }.also { bar ->
+            bar.onExpandToggle = { setOverlay(if (overlay == Overlay.CANDIDATES) Overlay.NONE else Overlay.CANDIDATES) }
+            bar.onToolbarAction = { onToolbarAction(it) }
+        }
         emoji = EmojiPanel(this, this).apply { visibility = View.GONE }
         candidatePanel = CandidatePanel(this) { pickFromPanel(it) }.apply { visibility = View.GONE }
+        toolPanel = ToolPanel(this, this).apply { visibility = View.GONE }
+        clipboardPanel = ClipboardPanel(this, clipboardStore, this).apply { visibility = View.GONE }
+        voicePanel = VoicePanel(this, this).apply { visibility = View.GONE }
         t9 = T9View(this, this).apply { visibility = View.GONE }
-        candidates.onExpandToggle = { setPanelExpanded(!candidates.expanded) }
+        handwriting = HandwritingView(this, this).apply { visibility = View.GONE }
 
         val stack = FrameLayout(this).apply {
             addView(keyboard, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            addView(emoji, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(t9, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(handwriting, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(emoji, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(candidatePanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(toolPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(clipboardPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(voicePanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -121,8 +199,6 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
             addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(previewOverlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             setOnApplyWindowInsetsListener { v, insets ->
-                // On Android 15 the IME nav strip (back / switcher buttons) is reported as a tappable
-                // element taller than the nav bar itself; keep keys clear of both.
                 val bottom = if (Build.VERSION.SDK_INT >= 30) maxOf(
                     insets.getInsets(WindowInsets.Type.navigationBars()).bottom,
                     insets.getInsets(WindowInsets.Type.tappableElement()).bottom)
@@ -136,7 +212,9 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     }
 
     private fun applyTheme(t: KbTheme) {
-        keyboard.theme = t; candidates.theme = t; emoji.theme = t; previewOverlay.theme = t; candidatePanel.theme = t; t9.theme = t
+        keyboard.theme = t; candidates.theme = t; emoji.theme = t; previewOverlay.theme = t
+        candidatePanel.theme = t; toolPanel.theme = t; clipboardPanel.theme = t; voicePanel.theme = t
+        t9.theme = t; handwriting.theme = t
         root.setBackgroundColor(t.background)
         @Suppress("DEPRECATION")
         window.window?.navigationBarColor = t.background
@@ -148,24 +226,38 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         applyTheme(KbTheme.of(this))
         scene = Scene.of(info)
         chinese = prefs.getBoolean(KEY_CHINESE, true) && !scene.forceEnglish
+        if (scene.forceEnglish || scene.initialPage != Page.LETTERS) handwritingMode = false
+        else handwritingMode = prefs.getBoolean(KEY_HANDWRITING, false) && chinese
+        if (handwritingMode) hwWorker.execute { HandwritingEngine.getOrLoad(applicationContext) }
         page = scene.initialPage
         shift = ShiftState.OFF
-        composing.clear(); result = null; lastAutoCorrect = null
+        composing.clear(); result = null; lastAutoCorrect = null; showNextPredictions = false
+        hwCandidates = emptyList()
+        if (::handwriting.isInitialized) { handwriting.clearCanvas(notify = false); handwriting.hasPendingComposition = false }
+        val savedSchema = prefs.getString(KEY_SCHEMA, "rime_ice")
+        rememberSchemaPreference(savedSchema)
         RimeEngine.traditional = prefs.getBoolean(KEY_TRADITIONAL, false)
-        RimeEngine.start(this, prefs.getString(KEY_SCHEMA, null)) // no-op when ready; applies a new scheme choice
+        RimeEngine.start(this, savedSchema)
         RimeEngine.clear(); zh = EMPTY_ZH
-        setPanelExpanded(false)
-        showEmoji(false)
+        setOverlay(Overlay.NONE)
         refreshLayout()
         updateAutoShift()
+        syncToolbarState()
         updateCandidates()
+        uiHandler.removeCallbacks(clipTick)
+        uiHandler.postDelayed(clipTick, 15_000L)
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
+        uiHandler.removeCallbacks(clipTick)
+        if (::voicePanel.isInitialized) voicePanel.stopAndRelease()
+        if (::handwriting.isInitialized) { handwriting.clearCanvas(notify = false); handwriting.hasPendingComposition = false }
+        hwCandidates = emptyList()
         if (composing.isNotEmpty()) { currentInputConnection?.finishComposingText(); composing.clear() }
         if (zhComposing) { RimeEngine.clear(); zh = EMPTY_ZH; currentInputConnection?.finishComposingText() }
         if (::keyboard.isInitialized) keyboard.cancelAll()
+        setOverlay(Overlay.NONE)
         history.save()
         prefs.edit().putFloat(KEY_AI_ALPHA, AiRanker.alpha).apply()
         aiSuggestion = null
@@ -173,13 +265,10 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
 
     override fun onUpdateSelection(oldSelStart: Int, oldSelEnd: Int, newSelStart: Int, newSelEnd: Int, candidatesStart: Int, candidatesEnd: Int) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
-        // Cursor moved away from the word being composed (tap elsewhere, cursor drag): drop composition.
-        // An update with no composing region right after our own edit is usually the echo of an
-        // earlier commit racing fast typing; dropping the word then would eat keystrokes.
         val stale = candidatesEnd < 0 && SystemClock.uptimeMillis() - lastEditAt < 300
         if (composing.isNotEmpty() && !stale && (newSelStart != candidatesEnd || newSelEnd != candidatesEnd)) {
             currentInputConnection?.finishComposingText()
-            composing.clear(); result = null
+            composing.clear(); result = null; showNextPredictions = false
             updateCandidates()
         }
         if (zhComposing && !stale && (newSelStart != candidatesEnd || newSelEnd != candidatesEnd)) {
@@ -187,7 +276,13 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
             currentInputConnection?.finishComposingText()
             updateCandidates()
         }
-        if (composing.isEmpty() && !zhComposing) updateAutoShift()
+        if (composing.isEmpty() && !zhComposing) {
+            if (!stale && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 2) {
+                showNextPredictions = false
+                updateCandidates()
+            }
+            updateAutoShift()
+        }
     }
 
     private fun loadSettings() {
@@ -198,7 +293,13 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         sound = prefs.getBoolean("sound", false)
     }
 
-    // ------------------------------------------------------------------ layout
+    private fun rememberSchemaPreference(schema: String?) {
+        if (schema == null) return
+        if (schema.startsWith("double_pinyin")) prefs.edit().putString(KEY_LAST_DOUBLE, schema).apply()
+        if (schema == "wubi86_jidian" || schema == "cangjie5") prefs.edit().putString(KEY_LAST_SHAPE, schema).apply()
+    }
+
+    // ------------------------------------------------------------------ layout & overlays
 
     private fun currentLayout(): Layout = when (page) {
         Page.LETTERS -> Layouts.letters(scene.bottomRow, chinese,
@@ -219,6 +320,8 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         keyboard.enterAccent = accent
         t9.enterLabel = label; t9.enterAccent = accent; t9.chinese = chinese
         t9.spaceLabel = "选定"
+        handwriting.enterLabel = label; handwriting.enterAccent = accent
+        syncToolbarState()
         syncStack()
         updateT9Side()
     }
@@ -256,6 +359,277 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         setShift(if (caps) ShiftState.ONCE else ShiftState.OFF)
     }
 
+    /** Extracts the immediately preceding English word in the current sentence for bigram context. */
+    private fun prevEnglishWord(): String? {
+        val ic = currentInputConnection ?: return null
+        val raw = ic.getTextBeforeCursor(48 + composing.length, 0)?.toString() ?: return null
+        val before = if (composing.isNotEmpty() && raw.endsWith(composing)) {
+            raw.dropLast(composing.length)
+        } else raw
+        if (before.isEmpty()) return null
+        val trimmed = before.trimEnd { it == ' ' || it == '\t' }
+        if (trimmed.isEmpty()) return null
+        val lastChar = trimmed.last()
+        // Stop bigram context across sentence boundaries (. ! ? newline)
+        if (lastChar in ".!?\n;:") return null
+        var i = trimmed.length - 1
+        while (i >= 0 && (trimmed[i].isLetter() || trimmed[i] == '\'' || trimmed[i] == '’')) i--
+        val word = trimmed.substring(i + 1)
+        return word.takeIf { it.any { c -> c.isLetter() } }
+    }
+
+    // ------------------------------------------------------------------ top toolbar & tool panels
+
+    private fun syncToolbarState() {
+        if (!::candidates.isInitialized) return
+        candidates.handwritingActive = handwritingMode
+        candidates.menuActive = overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.VOICE)
+        candidates.hasClips = clipboardStore.hasAny()
+        candidates.freshClip = if (scene.kind == FieldKind.PASSWORD) null else clipboardStore.freshClip()
+        if (::toolPanel.isInitialized) {
+            val schema = RimeEngine.currentSchema() ?: prefs.getString(KEY_SCHEMA, "rime_ice")
+            toolPanel.activeMode = when {
+                handwritingMode -> ToolPanel.InputMode.HANDWRITING
+                schema == "t9" -> ToolPanel.InputMode.T9
+                schema != null && schema.startsWith("double_pinyin") -> ToolPanel.InputMode.SHUANGPIN
+                schema == "wubi86_jidian" || schema == "cangjie5" -> ToolPanel.InputMode.SHAPE
+                else -> ToolPanel.InputMode.QUANPIN
+            }
+            val shapeSchema = prefs.getString(KEY_LAST_SHAPE, "wubi86_jidian")
+            toolPanel.shapeLabel = if (shapeSchema == "cangjie5") "仓颉" else "五笔"
+            toolPanel.traditional = RimeEngine.traditional
+            toolPanel.clipCount = clipboardStore.count()
+        }
+    }
+
+    private fun setOverlay(next: Overlay) {
+        if (!::keyboard.isInitialized) { overlay = next; return }
+        if (overlay == Overlay.VOICE && next != Overlay.VOICE) voicePanel.stopAndRelease()
+        val resolved = if (next == Overlay.CANDIDATES && !zhComposing && !hwComposing) Overlay.NONE else next
+        overlay = resolved
+        candidates.expanded = resolved == Overlay.CANDIDATES
+        val h = keyboard.height.takeIf { it > 0 } ?: (228 * resources.displayMetrics.density).toInt()
+        when (resolved) {
+            Overlay.CANDIDATES -> {
+                candidatePanel.layoutParams = candidatePanel.layoutParams.apply { height = h }
+                val list = if (hwComposing) hwCandidates else RimeEngine.snapshot(300).candidates.map { it.text }
+                candidatePanel.setItems(list)
+            }
+            Overlay.EMOJI -> {
+                emoji.layoutParams = emoji.layoutParams.apply { height = h }
+                emoji.onShown()
+            }
+            Overlay.TOOLS -> {
+                toolPanel.layoutParams = toolPanel.layoutParams.apply { height = h }
+                syncToolbarState()
+            }
+            Overlay.CLIPBOARD -> {
+                clipboardPanel.layoutParams = clipboardPanel.layoutParams.apply { height = h }
+                clipboardPanel.refresh()
+            }
+            Overlay.VOICE -> {
+                voicePanel.layoutParams = voicePanel.layoutParams.apply { height = h }
+                voicePanel.onShown()
+            }
+            Overlay.NONE -> Unit
+        }
+        syncToolbarState()
+        syncStack()
+    }
+
+    private fun onToolbarAction(action: CandidateBar.ToolbarAction) {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        when (action) {
+            CandidateBar.ToolbarAction.MENU -> {
+                if (zhComposing) zhCommitTop()
+                if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                showNextPredictions = false
+                updateCandidates()
+                setOverlay(if (overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.VOICE)) Overlay.NONE else Overlay.TOOLS)
+            }
+            CandidateBar.ToolbarAction.HANDWRITING_TOGGLE -> toggleHandwriting()
+            CandidateBar.ToolbarAction.CLIPBOARD -> {
+                if (zhComposing) zhCommitTop()
+                if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                showNextPredictions = false
+                updateCandidates()
+                setOverlay(if (overlay == Overlay.CLIPBOARD) Overlay.NONE else Overlay.CLIPBOARD)
+            }
+            CandidateBar.ToolbarAction.PASTE_FRESH -> {
+                val clip = clipboardStore.freshClip() ?: return
+                clipboardStore.dismissFresh()
+                currentInputConnection?.commitText(clip, 1)
+                syncToolbarState()
+            }
+            CandidateBar.ToolbarAction.DISMISS_FRESH -> {
+                clipboardStore.dismissFresh()
+                syncToolbarState()
+            }
+            CandidateBar.ToolbarAction.VOICE -> {
+                if (zhComposing) zhCommitTop()
+                if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                showNextPredictions = false
+                updateCandidates()
+                setOverlay(if (overlay == Overlay.VOICE) Overlay.NONE else Overlay.VOICE)
+            }
+            CandidateBar.ToolbarAction.HIDE -> {
+                setOverlay(Overlay.NONE)
+                requestHideSelf(0)
+            }
+        }
+    }
+
+    private fun toggleHandwriting() {
+        if (zhComposing) zhCommitTop()
+        if (hwComposing) hwCommitTop()
+        if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+        showNextPredictions = false
+        handwritingMode = !handwritingMode
+        if (handwritingMode) {
+            chinese = true
+            page = Page.LETTERS
+            prefs.edit().putBoolean(KEY_CHINESE, true).putBoolean(KEY_HANDWRITING, true).apply()
+            hwWorker.execute { HandwritingEngine.getOrLoad(applicationContext) }
+        } else {
+            prefs.edit().putBoolean(KEY_HANDWRITING, false).apply()
+            if (::handwriting.isInitialized) handwriting.clearCanvas(notify = false)
+        }
+        setOverlay(Overlay.NONE)
+        refreshLayout()
+        updateCandidates()
+    }
+
+    override fun onSelectInputMode(mode: ToolPanel.InputMode) {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (mode == ToolPanel.InputMode.HANDWRITING) {
+            if (!handwritingMode) toggleHandwriting() else setOverlay(Overlay.NONE)
+            return
+        }
+        if (hwComposing) hwCommitTop()
+        if (::handwriting.isInitialized) handwriting.clearCanvas(notify = false)
+        handwritingMode = false
+        prefs.edit().putBoolean(KEY_HANDWRITING, false).apply()
+        val targetSchema = when (mode) {
+            ToolPanel.InputMode.QUANPIN -> "rime_ice"
+            ToolPanel.InputMode.T9 -> "t9"
+            ToolPanel.InputMode.SHUANGPIN -> prefs.getString(KEY_LAST_DOUBLE, "double_pinyin_flypy") ?: "double_pinyin_flypy"
+            ToolPanel.InputMode.SHAPE -> prefs.getString(KEY_LAST_SHAPE, "wubi86_jidian") ?: "wubi86_jidian"
+            ToolPanel.InputMode.HANDWRITING -> return
+        }
+        chinese = true
+        page = Page.LETTERS
+        prefs.edit().putBoolean(KEY_CHINESE, true).putString(KEY_SCHEMA, targetSchema).apply()
+        rememberSchemaPreference(targetSchema)
+        RimeEngine.start(this, targetSchema)
+        RimeEngine.selectSchema(targetSchema)
+        setOverlay(Overlay.NONE)
+        refreshLayout()
+        updateCandidates()
+    }
+
+    override fun onToolTile(tile: ToolPanel.Tile) {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        when (tile) {
+            ToolPanel.Tile.CLIPBOARD -> setOverlay(Overlay.CLIPBOARD)
+            ToolPanel.Tile.VOICE -> setOverlay(Overlay.VOICE)
+            ToolPanel.Tile.TRADITIONAL -> {
+                val next = !RimeEngine.traditional
+                RimeEngine.traditional = next
+                prefs.edit().putBoolean(KEY_TRADITIONAL, next).apply()
+                syncToolbarState()
+            }
+            ToolPanel.Tile.SWITCH_IME -> {
+                setOverlay(Overlay.NONE)
+                (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+            }
+            ToolPanel.Tile.SETTINGS -> {
+                setOverlay(Overlay.NONE)
+                requestHideSelf(0)
+                startActivity(Intent(this, SetupActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }
+            ToolPanel.Tile.HIDE -> {
+                setOverlay(Overlay.NONE)
+                requestHideSelf(0)
+            }
+        }
+    }
+
+    override fun onEditAction(action: ToolPanel.EditAction) {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        val ic = currentInputConnection ?: return
+        when (action) {
+            ToolPanel.EditAction.LEFT -> onCursorMove(-1)
+            ToolPanel.EditAction.RIGHT -> onCursorMove(1)
+            ToolPanel.EditAction.SELECT_ALL -> ic.performContextMenuAction(android.R.id.selectAll)
+            ToolPanel.EditAction.COPY -> ic.performContextMenuAction(android.R.id.copy)
+            ToolPanel.EditAction.PASTE -> {
+                if (!ic.performContextMenuAction(android.R.id.paste)) {
+                    clipboardStore.items().firstOrNull()?.let { ic.commitText(it.text, 1) }
+                }
+            }
+            ToolPanel.EditAction.DELETE -> onDeleteDown(false)
+        }
+    }
+
+    override fun onClipboardCommit(text: String) {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        clipboardStore.dismissFresh()
+        currentInputConnection?.commitText(text, 1)
+        setOverlay(Overlay.NONE)
+        syncToolbarState()
+    }
+
+    override fun onClipboardChanged() = syncToolbarState()
+
+    override fun onClipboardClose() = setOverlay(Overlay.NONE)
+
+    override fun onVoiceCommit(text: String) {
+        currentInputConnection?.finishComposingText()
+        currentInputConnection?.commitText(text, 1)
+    }
+
+    override fun onVoicePartial(text: String) {
+        val ic = currentInputConnection ?: return
+        if (text.isEmpty()) ic.finishComposingText() else ic.setComposingText(text, 1)
+    }
+
+    override fun onVoiceDelete() = onDeleteDown(false)
+
+    override fun onVoiceClose() = setOverlay(Overlay.NONE)
+
+    override fun onVoiceRequestPermission() {
+        requestHideSelf(0)
+        startActivity(
+            Intent(this, SetupActivity::class.java)
+                .putExtra(SetupActivity.EXTRA_REQUEST_MIC, true)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+
+    override fun hasSystemVoiceIme(): Boolean = findSystemVoiceIme() != null
+
+    override fun onSwitchSystemVoiceIme() {
+        val id = findSystemVoiceIme() ?: return
+        setOverlay(Overlay.NONE)
+        if (Build.VERSION.SDK_INT >= 28) switchInputMethod(id)
+        else (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+    }
+
+    private fun findSystemVoiceIme(): String? {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+        for (imi in imm.enabledInputMethodList) {
+            if (imi.packageName == packageName) continue
+            val subtypes = imm.getEnabledInputMethodSubtypeList(imi, true)
+            if (subtypes.any { it.mode.equals("voice", ignoreCase = true) } ||
+                imi.serviceName.contains("voice", ignoreCase = true) ||
+                imi.id.contains("voice", ignoreCase = true)
+            ) {
+                return imi.id
+            }
+        }
+        return null
+    }
+
     // ------------------------------------------------------------------ keyboard callbacks
 
     override fun onKeyDownFeedback(key: Key) {
@@ -278,37 +652,35 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         val ic = currentInputConnection ?: return
         if (zhActive && page == Page.LETTERS && text.length == 1) {
             val c = text[0]
-            // Lowercase letters go to librime; while composing, shifted letters do too.
             if (c in 'a'..'z' || (zhComposing && c in 'A'..'Z')) {
                 zhKey(c.lowercaseChar().code)
                 if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
                 return
             }
         }
-        // Anything else (punctuation, digits, capitals) ends the Chinese composition with the top candidate.
         if (zhComposing) zhCommitTop()
         val letterLike = text.length == 1 && (text[0].isLetter() || (text == "'" && composing.isNotEmpty()))
         val composes = page == Page.LETTERS && letterLike && usesComposing()
         if (composes) {
             composing.append(text)
+            showNextPredictions = false
             ic.setComposingText(composing, 1)
             if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
         } else {
             if (composing.isNotEmpty()) {
-                // punctuation ends a word; auto-correct like space would (English prose only)
                 val punct = text.length == 1 && text[0] in ".,?!;:"
                 commitComposing(useAutoCorrect = punct)
             }
             ic.commitText(text, 1)
+            showNextPredictions = false
             if (shift == ShiftState.ONCE && page == Page.LETTERS) setShift(ShiftState.OFF)
             if (text.length == 1 && text[0] in ".?!。？！") updateAutoShift()
         }
         updateCandidates()
     }
 
-    /** Composition (marked text) is used for prose and Chinese; addresses and passwords type straight through. */
     private fun usesComposing(): Boolean =
-        if (chinese) !RimeEngine.isReady // raw-letter fallback while the Chinese engine deploys
+        if (chinese) !RimeEngine.isReady
         else scene.suggestions && (scene.kind == FieldKind.TEXT || scene.kind == FieldKind.PERSON_NAME)
 
     override fun onFunction(key: Key) {
@@ -323,32 +695,40 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
                     else -> ShiftState.ONCE
                 })
                 lastShiftTap = now
+                if (showNextPredictions && composing.isEmpty()) updateCandidates()
             }
             KeyType.SPACE -> onSpace()
             KeyType.ENTER -> {
                 lastAutoCorrect = null
-                if (zhComposing) { zhCommitRaw(); return } // like iOS: return confirms the letters as typed
+                showNextPredictions = false
+                if (hwComposing) { hwCommitTop(); return }
+                if (zhComposing) { zhCommitRaw(); return }
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
                 if (scene.action != EditorInfo.IME_ACTION_NONE) ic?.performEditorAction(scene.action)
                 else sendKeyChar('\n')
                 updateAutoShift()
                 updateCandidates()
             }
-            KeyType.TO_SYMBOLS -> { page = Page.SYMBOLS; refreshLayout() }
+            KeyType.TO_SYMBOLS -> { if (hwComposing) hwCommitTop(); page = Page.SYMBOLS; refreshLayout() }
             KeyType.TO_SYMBOLS2 -> { page = Page.SYMBOLS2; refreshLayout() }
             KeyType.TO_LETTERS -> { page = Page.LETTERS; refreshLayout(); updateAutoShift() }
             KeyType.LANG -> {
+                if (hwComposing) hwCommitTop()
                 if (zhComposing) zhCommitRaw()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                showNextPredictions = false
                 chinese = !chinese
+                if (!chinese) handwritingMode = false
                 prefs.edit().putBoolean(KEY_CHINESE, chinese).apply()
                 if (chinese) RimeEngine.start(this, prefs.getString(KEY_SCHEMA, null))
                 refreshLayout(); updateAutoShift(); updateCandidates()
             }
             KeyType.EMOJI -> {
+                if (hwComposing) hwCommitTop()
                 if (zhComposing) zhCommitTop()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-                showEmoji(true)
+                showNextPredictions = false
+                setOverlay(Overlay.EMOJI)
             }
             else -> Unit
         }
@@ -366,13 +746,16 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         lastEditAt = SystemClock.uptimeMillis()
         val ic = currentInputConnection ?: return
         val now = SystemClock.uptimeMillis()
+        if (hwComposing) {
+            hwCommitTop()
+            return
+        }
         if (zhComposing) {
-            if (aiSuggestion != null) commitAi() else zhKey(Rime.XK_SPACE) // picks the highlighted candidate
+            if (aiSuggestion != null) commitAi() else zhKey(Rime.XK_SPACE)
             return
         }
         if (composing.isNotEmpty()) {
             if (chinese) {
-                // M1: no Chinese engine yet, commit the raw letters. librime lands in M2.
                 commitComposing(useAutoCorrect = false)
                 ic.commitText(" ", 1)
             } else {
@@ -380,6 +763,7 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
                 val committed = commitComposing(useAutoCorrect = true)
                 ic.commitText(" ", 1)
                 if (committed != typed) lastAutoCorrect = typed to committed
+                showNextPredictions = scene.suggestions && scene.kind == FieldKind.TEXT
             }
         } else {
             lastAutoCorrect = null
@@ -390,10 +774,12 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
                 ic.deleteSurroundingText(1, 0)
                 ic.commitText(". ", 1)
                 lastSpaceAt = 0
+                showNextPredictions = false
                 updateAutoShift(); updateCandidates()
                 return
             }
             ic.commitText(" ", 1)
+            showNextPredictions = !chinese && scene.suggestions && scene.kind == FieldKind.TEXT
         }
         lastSpaceAt = now
         if (page == Page.SYMBOLS || page == Page.SYMBOLS2) { page = Page.LETTERS; refreshLayout() }
@@ -412,10 +798,10 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
             if (composing.isEmpty()) updateAutoShift()
             return
         }
+        showNextPredictions = false
         val undo = lastAutoCorrect
         lastAutoCorrect = null
         if (undo != null && !repeat) {
-            // iOS behaviour: backspace right after an auto-correction restores what was typed.
             val (typed, corrected) = undo
             val before = ic.getTextBeforeCursor(corrected.length + 1, 0)?.toString()
             if (before == "$corrected ") {
@@ -437,6 +823,7 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     override fun onCursorMove(steps: Int) {
         if (zhComposing) zhCommitRaw()
         if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+        showNextPredictions = false
         val code = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
         repeat(kotlin.math.abs(steps)) { sendDownUpKeyEvents(code) }
         if (haptics) root.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
@@ -445,13 +832,14 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     /** Commits the composing word; returns what was actually committed. */
     private fun commitComposing(useAutoCorrect: Boolean): String {
         val ic = currentInputConnection
+        val prev = if (!chinese) prevEnglishWord() else null
         val typed = composing.toString()
         var out = typed
         if (!chinese && useAutoCorrect && autoCorrect && scene.autoCorrect) {
             if (typed != rejected) result?.takeIf { it.typed == typed }?.autoCorrect?.let { out = it }
         }
         ic?.commitText(out, 1)
-        if (!chinese && scene.learn) english?.learn(out)
+        if (!chinese && scene.learn) english?.learn(out, prevWord = prev)
         composing.clear(); result = null
         rejected = null
         return out
@@ -464,7 +852,12 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         val labels = ArrayList<String>()
         val commits = ArrayList<String>()
         var highlight = -1
+        var keepToolbarEdges = false
         when {
+            hwComposing -> {
+                for (c in hwCandidates) { labels += c; commits += c }
+                highlight = 0
+            }
             zhComposing -> {
                 aiSuggestion?.let { labels += it; commits += it }
                 zh.candidates.forEach { if (it.text != aiSuggestion) { labels += it.text; commits += it.text } }
@@ -478,7 +871,8 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
             }
             composing.isNotEmpty() -> {
                 val typed = composing.toString()
-                val r = english?.suggest(typed)
+                val prev = prevEnglishWord()
+                val r = english?.suggest(typed, prevWord = prev)
                 result = r
                 val auto = if (autoCorrect && scene.autoCorrect && typed != rejected) r?.autoCorrect else null
                 if (auto != null) {
@@ -493,16 +887,23 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
             }
             scene.kind == FieldKind.EMAIL -> emailSuggestions(labels, commits)
             scene.kind == FieldKind.URL -> urlSuggestions(labels, commits)
+            !chinese && showNextPredictions && scene.suggestions && scene.kind == FieldKind.TEXT && overlay == Overlay.NONE -> {
+                val prev = prevEnglishWord()
+                val nexts = english?.predictNext(prev, capitalizeFirst = shift != ShiftState.OFF, max = 6).orEmpty()
+                for (w in nexts) { labels += w; commits += w }
+                keepToolbarEdges = labels.isNotEmpty()
+            }
         }
-        if (!scene.suggestions && !chinese) { labels.clear(); commits.clear(); highlight = -1 }
+        if (!scene.suggestions && !chinese) { labels.clear(); commits.clear(); highlight = -1; keepToolbarEdges = false }
         if (labels.isEmpty() && chinese && RimeEngine.state == RimeEngine.State.DEPLOYING) {
             labels += "正在准备中文词库（仅首次）…"; commits += ""
         }
         shownCandidates = labels
         candidateCommits = commits
-        candidates.setItems(labels, highlight)
-        candidates.expandable = zhComposing && labels.size > 3
-        if (!zhComposing && candidates.expanded) setPanelExpanded(false)
+        syncToolbarState()
+        candidates.expandable = (zhComposing || hwComposing) && labels.size > 3
+        candidates.setItems(labels, highlight, keepToolbarEdges = keepToolbarEdges)
+        if (!zhComposing && !hwComposing && overlay == Overlay.CANDIDATES) setOverlay(Overlay.NONE)
     }
 
     private fun emailSuggestions(labels: MutableList<String>, commits: MutableList<String>) {
@@ -531,24 +932,38 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     private fun pickCandidate(index: Int) {
         lastEditAt = SystemClock.uptimeMillis()
         val ic = currentInputConnection ?: return
+        if (hwComposing) {
+            val picked = candidateCommits.getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return
+            hwCommit(picked)
+            return
+        }
         if (zhComposing) {
             val ai = aiSuggestion
             if (ai != null && index == 0) { commitAi(); return }
-            // Map the bar index back to librime's list (the AI suggestion, if any, is not in it).
             val text = candidateCommits.getOrNull(index)
             val rimeIndex = zh.candidates.indexOfFirst { it.text == text }.takeIf { it >= 0 } ?: index
             if (ai != null) AiRanker.feedback(pickedAi = false, pickedRime = rimeIndex == 0)
-            RimeEngine.select(rimeIndex) // may commit, or leave the rest of a long input composing
+            RimeEngine.select(rimeIndex)
             zhSync()
             return
         }
         val text = candidateCommits.getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return
         lastAutoCorrect = null
         if (composing.isNotEmpty()) {
+            val prev = if (!chinese) prevEnglishWord() else null
             ic.commitText(text, 1)
-            if (!chinese && scene.learn) english?.learn(text)
+            if (!chinese && scene.learn) english?.learn(text, prevWord = prev)
             composing.clear(); result = null
-            if (scene.spaceAfterPick && !chinese) ic.commitText(" ", 1)
+            if (scene.spaceAfterPick && !chinese) {
+                ic.commitText(" ", 1)
+                showNextPredictions = scene.suggestions && scene.kind == FieldKind.TEXT
+            }
+        } else if (!chinese && showNextPredictions && scene.kind == FieldKind.TEXT) {
+            val prev = prevEnglishWord()
+            ic.commitText("$text ", 1)
+            if (scene.learn) english?.learn(text, prevWord = prev)
+            if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
+            showNextPredictions = true
         } else {
             ic.commitText(text, 1)
         }
@@ -563,7 +978,6 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     private val zhActive: Boolean get() = chinese && RimeEngine.isReady
 
     private val rimeListener: () -> Unit = {
-        // Deployment finished (or failed): refresh the space label and any waiting composition.
         if (::keyboard.isInitialized && chinese) { refreshLayout(); updateCandidates() }
     }
 
@@ -573,7 +987,6 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         zhSync()
     }
 
-    /** Mirrors librime's commit and composition into the editor and the candidate bar. */
     private fun zhSync() {
         lastEditAt = SystemClock.uptimeMillis()
         val ic = currentInputConnection
@@ -582,7 +995,7 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         if (commit != null) { ic?.commitText(commit, 1); AiRanker.remember(commit) }
         if (zh.input != aiInput) aiSuggestion = null
         if (zh.composing) ic?.setComposingText(zhDisplay(), 1)
-        else if (commit == null) ic?.commitText("", 1) // composition emptied by backspace
+        else if (commit == null) ic?.commitText("", 1)
         updateCandidates()
         updateT9Side()
         scheduleAi()
@@ -590,49 +1003,45 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
 
     // ------------------------------------------------------------------ AI re-ranking
 
-    /** Sentence the LM prefers over librime's first choice, valid while zh.input == aiInput. */
     private var aiSuggestion: String? = null
     private var aiInput: String = ""
     private val aiWorker = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "ai").apply { priority = Thread.MIN_PRIORITY }
     }
-    private val aiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val aiHandler = Handler(Looper.getMainLooper())
     private var aiPending: Runnable? = null
-    /** Bumped on every composition change; a job whose generation is old is stale and skipped. */
     private val aiGeneration = java.util.concurrent.atomic.AtomicLong()
 
     private fun aiEnabled(): Boolean = prefs.getBoolean(KEY_AI, true) && AiRanker.hasModel(this)
 
-    /**
-     * After the user pauses briefly, ask the LM about the current input. Only long-enough pinyin
-     * input with no partial selection is considered, and stale results are dropped — so typing
-     * speed is never affected and the model runs only at natural pauses (battery).
-     */
     private fun scheduleAi() {
         aiPending?.let { aiHandler.removeCallbacks(it) }
         val gen = aiGeneration.incrementAndGet()
-        AiRanker.abort() // anything still running is about an older input
+        AiRanker.abort()
         if (!zhComposing || !aiEnabled()) return
         val schema = RimeEngine.currentSchema() ?: return
         if (!AiRanker.supports(schema)) return
         val shown = zhDisplay()
-        if (shown.any { it in '㐀'..'鿿' }) return // user already picked part of it
+        if (shown.any { it in '㐀'..'鿿' }) return
         val syllables = AiRanker.syllableCount(shown)
         if (syllables < 3) return
         val input = zh.input
         val before = currentInputConnection?.getTextBeforeCursor(48 + shown.length, 0)?.toString().orEmpty()
         val context = before.dropLast(shown.length.coerceAtMost(before.length))
         val job = Runnable {
-            aiWorker.execute { try {
-                if (gen != aiGeneration.get() || !AiRanker.ensureLoaded(applicationContext)) return@execute
-                val s = AiRanker.suggest(context, schema, input, syllables) { gen != aiGeneration.get() } ?: return@execute
-                aiHandler.post {
-                    if (zh.input == input && zhComposing) {
-                        aiSuggestion = s.text; aiInput = input
-                        updateCandidates()
+            aiWorker.execute {
+                try {
+                    if (gen != aiGeneration.get() || !AiRanker.ensureLoaded(applicationContext)) return@execute
+                    val s = AiRanker.suggest(context, schema, input, syllables) { gen != aiGeneration.get() } ?: return@execute
+                    aiHandler.post {
+                        if (zh.input == input && zhComposing) {
+                            aiSuggestion = s.text; aiInput = input
+                            updateCandidates()
+                        }
                     }
+                } catch (t: Throwable) {
+                    android.util.Log.e("ImeService", "AI suggestion failed", t)
                 }
-            } catch (t: Throwable) { android.util.Log.e("ImeService", "AI suggestion failed", t) }
             }
         }
         aiPending = job
@@ -648,12 +1057,11 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         currentInputConnection?.commitText(text, 1)
         AiRanker.feedback(pickedAi = true, pickedRime = false)
         AiRanker.remember(text)
-        setPanelExpanded(false)
+        setOverlay(Overlay.NONE)
         updateCandidates()
         updateT9Side()
     }
 
-    /** Inline text while composing. 九宫格 input is digits, so show the top candidate's pinyin. */
     private fun zhDisplay(): String {
         if (isT9()) {
             val (head, tail) = T9.split(zh.input)
@@ -664,34 +1072,100 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
         return zh.preedit.ifEmpty { zh.input }
     }
 
-    /** Opens/closes the full candidate grid in place of the keys. */
-    private fun setPanelExpanded(open: Boolean) {
-        if (!::candidatePanel.isInitialized) return
-        val show = open && zhComposing
-        candidates.expanded = show
-        if (show) {
-            candidatePanel.layoutParams = candidatePanel.layoutParams.apply { height = keyboard.height }
-            candidatePanel.setItems(RimeEngine.snapshot(300).candidates.map { it.text })
-        }
-        syncStack()
-    }
+    // ------------------------------------------------------------------ stack, 九宫格 & 手写
 
-    // ------------------------------------------------------------------ 九宫格
+    private fun isHandwritingVisible(): Boolean = chinese && page == Page.LETTERS && handwritingMode
+    private fun isT9(): Boolean = chinese && page == Page.LETTERS && RimeEngine.currentSchema() == "t9" && !handwritingMode
 
-    private var emojiShown = false
-
-    private fun isT9(): Boolean = chinese && page == Page.LETTERS && RimeEngine.currentSchema() == "t9"
-
-    /** One place decides which of keys / 九宫格 / emoji / candidate grid is visible. */
     private fun syncStack() {
         if (!::keyboard.isInitialized) return
-        val panelOn = candidates.expanded && !emojiShown
-        val t9On = isT9() && !emojiShown && !panelOn
-        emoji.visibility = if (emojiShown) View.VISIBLE else View.GONE
-        candidatePanel.visibility = if (panelOn) View.VISIBLE else View.GONE
+        val hwOn = overlay == Overlay.NONE && isHandwritingVisible()
+        val t9On = overlay == Overlay.NONE && !hwOn && isT9()
+        emoji.visibility = if (overlay == Overlay.EMOJI) View.VISIBLE else View.GONE
+        candidatePanel.visibility = if (overlay == Overlay.CANDIDATES) View.VISIBLE else View.GONE
+        toolPanel.visibility = if (overlay == Overlay.TOOLS) View.VISIBLE else View.GONE
+        clipboardPanel.visibility = if (overlay == Overlay.CLIPBOARD) View.VISIBLE else View.GONE
+        voicePanel.visibility = if (overlay == Overlay.VOICE) View.VISIBLE else View.GONE
+        handwriting.visibility = if (hwOn) View.VISIBLE else View.GONE
         t9.visibility = if (t9On) View.VISIBLE else View.GONE
         // The QWERTY view stays laid out (INVISIBLE) so the stack keeps its height.
-        keyboard.visibility = if (!emojiShown && !panelOn && !t9On) View.VISIBLE else View.INVISIBLE
+        keyboard.visibility = if (overlay == Overlay.NONE && !t9On && !hwOn) View.VISIBLE else View.INVISIBLE
+    }
+
+    override fun onHandwritingStrokes(strokes: List<List<HandwritingEngine.Point>>) {
+        val gen = hwGen.incrementAndGet()
+        hwWorker.execute {
+            val engine = HandwritingEngine.getOrLoad(applicationContext) ?: return@execute
+            val rawCands = engine.recognize(strokes, topK = 14, preferChinese = true)
+            val cands = if (RimeEngine.traditional) {
+                rawCands.map { HandwritingEngine.toTraditional(applicationContext, it) }.distinct()
+            } else rawCands
+            uiHandler.post {
+                if (gen != hwGen.get() || !handwritingMode) return@post
+                lastEditAt = SystemClock.uptimeMillis()
+                hwCandidates = cands
+                handwriting.hasPendingComposition = cands.isNotEmpty()
+                val top = cands.firstOrNull()
+                if (top != null) currentInputConnection?.setComposingText(top, 1)
+                updateCandidates()
+            }
+        }
+    }
+
+    override fun onHandwritingAutoCommitPrevious() {
+        val top = hwCandidates.firstOrNull() ?: return
+        lastEditAt = SystemClock.uptimeMillis()
+        hwGen.incrementAndGet()
+        hwCandidates = emptyList()
+        handwriting.hasPendingComposition = false
+        currentInputConnection?.commitText(top, 1)
+        AiRanker.remember(top)
+        updateCandidates()
+    }
+
+    override fun onHandwritingClear() {
+        lastEditAt = SystemClock.uptimeMillis()
+        hwGen.incrementAndGet()
+        hwCandidates = emptyList()
+        handwriting.hasPendingComposition = false
+        currentInputConnection?.commitText("", 1)
+        HandwritingEngine.getOrLoad(applicationContext)?.clearCache()
+        updateCandidates()
+    }
+
+    override fun onHandwritingPunct(punct: String) {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (hwComposing) hwCommitTop()
+        currentInputConnection?.commitText(punct, 1)
+    }
+
+    override fun onHandwritingExitToKeyboard() {
+        if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+        if (hwComposing) hwCommitTop()
+        handwritingMode = false
+        prefs.edit().putBoolean(KEY_HANDWRITING, false).apply()
+        handwriting.clearCanvas(notify = false)
+        refreshLayout()
+        updateCandidates()
+    }
+
+    private fun hwCommitTop() {
+        val top = hwCandidates.firstOrNull() ?: return
+        hwCommit(top)
+    }
+
+    private fun hwCommit(text: String) {
+        lastEditAt = SystemClock.uptimeMillis()
+        hwGen.incrementAndGet()
+        hwCandidates = emptyList()
+        if (::handwriting.isInitialized) {
+            handwriting.clearCanvas(notify = false)
+            handwriting.hasPendingComposition = false
+        }
+        currentInputConnection?.commitText(text, 1)
+        AiRanker.remember(text)
+        setOverlay(Overlay.NONE)
+        updateCandidates()
     }
 
     private val T9_PUNCT = listOf("，", "。", "？", "！", "、", "：", "；", "…", "～", "“", "”", "（", "）")
@@ -718,7 +1192,6 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     override fun onT9Side(index: Int) {
         val item = t9.sideItems.getOrNull(index) ?: return
         if (t9SideIsPinyin && zhComposing) {
-            // Pin the first digits to this syllable by re-feeding the edited input.
             val input = T9.applyPick(zh.input, item)
             RimeEngine.clear()
             input.forEach { RimeEngine.processKey(it.code) }
@@ -730,20 +1203,23 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     }
 
     private fun pickFromPanel(index: Int) {
-        if (!zhComposing) { setPanelExpanded(false); return }
+        if (hwComposing) {
+            val picked = hwCandidates.getOrNull(index)
+            if (picked != null) hwCommit(picked) else setOverlay(Overlay.NONE)
+            return
+        }
+        if (!zhComposing) { setOverlay(Overlay.NONE); return }
         RimeEngine.select(index)
         zhSync()
-        setPanelExpanded(false)
+        setOverlay(Overlay.NONE)
     }
 
-    /** Ends the composition with the highlighted candidate. */
     private fun zhCommitTop() {
         if (!zhComposing) return
         if (zh.candidates.isEmpty()) { zhCommitRaw(); return }
         if (aiSuggestion != null) commitAi() else zhKey(Rime.XK_SPACE)
     }
 
-    /** Ends the composition keeping the typed letters (九宫格: the spelled pinyin, not digits). */
     private fun zhCommitRaw() {
         if (!zhComposing) return
         val raw = if (isT9()) zhDisplay().replace(" ", "") else zh.input
@@ -755,16 +1231,6 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
 
     // ------------------------------------------------------------------ emoji
 
-    private fun showEmoji(show: Boolean) {
-        if (!::emoji.isInitialized) return
-        emojiShown = show
-        if (show) {
-            emoji.layoutParams = emoji.layoutParams.apply { height = keyboard.height }
-            emoji.onShown()
-        }
-        syncStack()
-    }
-
     override fun onEmoji(emoji: String) {
         currentInputConnection?.commitText(emoji, 1)
         if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
@@ -773,7 +1239,7 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
     override fun onEmojiDelete() = onDeleteDown(false)
 
     override fun onEmojiClose() {
-        showEmoji(false)
+        setOverlay(Overlay.NONE)
         updateAutoShift()
     }
 
@@ -781,14 +1247,19 @@ class ImeService : InputMethodService(), KeyboardView.Listener, EmojiPanel.Liste
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        // The model is mmapped, but its context buffers are not: give them back under pressure.
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) aiWorker.execute { AiRanker.unload() }
+        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            aiWorker.execute { AiRanker.unload() }
+            if (!handwritingMode) hwWorker.execute { HandwritingEngine.unload() }
+        }
     }
 
     companion object {
         const val PREFS = "settings"
         const val KEY_CHINESE = "chinese"
+        const val KEY_HANDWRITING = "handwriting"
         const val KEY_SCHEMA = "schema"
+        const val KEY_LAST_DOUBLE = "last_double_schema"
+        const val KEY_LAST_SHAPE = "last_shape_schema"
         const val KEY_TRADITIONAL = "traditional"
         const val KEY_AI = "ai_rerank"
         const val KEY_AI_ALPHA = "ai_alpha"

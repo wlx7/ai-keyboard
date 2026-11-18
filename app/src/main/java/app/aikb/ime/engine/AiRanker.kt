@@ -27,7 +27,7 @@ object AiRanker {
     const val MIN_SYLLABLES = 3
     private const val MIN_ALPHA = 0.5f
     private const val MAX_ALPHA = 8f
-    private const val MAX_CANDIDATES = 10
+    private const val MAX_CANDIDATES = 16
 
     @Volatile var alpha = DEFAULT_ALPHA
     @Volatile private var loaded = false

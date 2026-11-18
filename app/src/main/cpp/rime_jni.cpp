@@ -318,36 +318,91 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
         std::string in = fromJava(env, input);
         g_abortExplore = false;
         auto add = [&](const std::string& s) {
-            if (!s.empty() && std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+            if (!s.empty() && out.size() < 20 && std::find(out.begin(), out.end(), s) == out.end())
+                out.push_back(s);
         };
-        exploreFeed(in);
-        add(explorePreview());
-        auto level1 = exploreCandidates(firstK * 3);
-        int tried = 0;
-        for (size_t i = 0; i < level1.size() && tried < firstK && !g_abortExplore; ++i) {
-            const auto& [text, len] = level1[i];
-            if (len == static_cast<size_t>(syllables)) { add(text); continue; } // whole sentence
-            if (len == 0 || len > static_cast<size_t>(syllables)) continue;
-            ++tried;
-            if (!g_api->select_candidate(g_explore, i)) continue;
-            const std::string afterI = explorePreview();
-            add(afterI);
-            const size_t rest = syllables - len;
-            auto level2 = exploreCandidates(secondK * 3);
-            int tried2 = 0;
-            for (size_t j = 0; j < level2.size() && tried2 < secondK && !g_abortExplore; ++j) {
-                const auto& [t2, l2] = level2[j];
-                if (l2 == rest) { add(text + t2); continue; }
-                if (l2 == 0 || l2 > rest) continue;
-                ++tried2;
-                if (!g_api->select_candidate(g_explore, j)) continue;
-                add(explorePreview());
-                exploreUndo(in);
-                // Back to "word i selected"? If BackSpace unwound further, rebuild that state.
-                if (explorePreview() != afterI) { exploreFeed(in); g_api->select_candidate(g_explore, i); }
+
+        // Helper: re-establish spine state by feeding input and replaying [spineChoices]
+        auto restoreSpine = [&](const std::vector<size_t>& spineChoices) -> bool {
+            exploreFeed(in);
+            for (size_t idx : spineChoices) {
+                if (!g_api->select_candidate(g_explore, idx)) return false;
             }
-            exploreUndo(in);
+            return true;
+        };
+
+        exploreFeed(in);
+        const std::string defaultSentence = explorePreview();
+        add(defaultSentence);
+
+        // Walk along librime's top-choice spine from start to end of the sentence, branching at
+        // EVERY word boundary (not only the first two words) so mid- and end-of-sentence homophones
+        // (e.g. "预期/与其", "锁好/所好", "网上订/往上顶", "简洁/简介") enter the candidate pool.
+        std::vector<size_t> spine;
+        std::string prefixText;
+        size_t covered = 0;
+        const size_t totalSyl = static_cast<size_t>(std::max<jint>(syllables, 0));
+
+        for (int step = 0; step < 10 && covered < totalSyl && !g_abortExplore && out.size() < 20; ++step) {
+            const size_t rem = totalSyl - covered;
+            const int branchLimit = (step == 0) ? std::max<int>(firstK, 4) : 3;
+            auto cands = exploreCandidates(branchLimit * 3 + 2);
+            if (cands.empty()) break;
+
+            // Find spine choice (first partial/full word that fits remaining syllables, skipping index 0 full-sentence if step==0)
+            int spineIdx = -1;
+            for (size_t i = 0; i < cands.size(); ++i) {
+                const auto& [txt, len] = cands[i];
+                if (step == 0 && i == 0 && len == totalSyl && cands.size() > 1) continue; // sentence preview entry; pick word-level spine
+                if (len > 0 && len <= rem) { spineIdx = static_cast<int>(i); break; }
+            }
+
+            // Explore alternative words at this segment position
+            int branched = 0;
+            for (size_t i = 0; i < cands.size() && branched < branchLimit && !g_abortExplore; ++i) {
+                if (static_cast<int>(i) == spineIdx) continue;
+                const auto& [txt, len] = cands[i];
+                if (len == 0 || len > rem) continue;
+                if (len == rem) {
+                    // Completes the rest of the sentence: read directly without selecting (never writes userdb!)
+                    add(prefixText + txt);
+                    ++branched;
+                    continue;
+                }
+                ++branched;
+                if (!g_api->select_candidate(g_explore, i)) continue;
+                const std::string branchSent = explorePreview();
+                add(branchSent);
+
+                // Look one more segment ahead for consecutive homophone pairs (e.g. "网上" + "订")
+                if (secondK > 0 && step < 4 && out.size() < 20) {
+                    const size_t rem2 = rem - len;
+                    auto cands2 = exploreCandidates(secondK * 2 + 2);
+                    int b2 = 0;
+                    for (size_t j = 0; j < cands2.size() && b2 < secondK && !g_abortExplore; ++j) {
+                        const auto& [t2, l2] = cands2[j];
+                        if (l2 == 0 || l2 > rem2) continue;
+                        if (l2 == rem2) { add(prefixText + txt + t2); ++b2; continue; }
+                        if (j == 0) continue; // j==0 is already in branchSent
+                        ++b2;
+                        if (g_api->select_candidate(g_explore, j)) {
+                            add(explorePreview());
+                            if (!restoreSpine(spine) || !g_api->select_candidate(g_explore, i)) break;
+                        }
+                    }
+                }
+                if (!restoreSpine(spine)) break;
+            }
+
+            if (spineIdx < 0) break;
+            const auto [sTxt, sLen] = cands[spineIdx];
+            if (sLen >= rem) break; // reached final segment (its alternatives were just read above!)
+            if (!g_api->select_candidate(g_explore, static_cast<size_t>(spineIdx))) break;
+            spine.push_back(static_cast<size_t>(spineIdx));
+            prefixText += sTxt;
+            covered += sLen;
         }
+
         g_api->clear_composition(g_explore);
         RIME_STRUCT(RimeCommit, commit); // defensive: never leave a commit pending
         if (g_api->get_commit(g_explore, &commit)) g_api->free_commit(&commit);
