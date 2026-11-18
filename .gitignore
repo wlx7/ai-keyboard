@@ -1,0 +1,13 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+/tools/data/
+/dist/
+/third_party/
+# native build intermediates
+.cxx/
+# generated from tools/data by tools/build_rime_data.sh (52 MB of third-party data)
+/app/src/main/assets/rime/
