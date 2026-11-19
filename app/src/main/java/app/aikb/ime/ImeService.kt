@@ -1236,7 +1236,7 @@ class ImeService : InputMethodService(),
         val gen = hwGen.incrementAndGet()
         hwWorker.execute {
             val engine = HandwritingEngine.getOrLoad(applicationContext) ?: return@execute
-            val rawCands = engine.recognize(strokes, topK = 14, preferChinese = true)
+            val rawCands = engine.recognize(strokes, topK = 36, preferChinese = true)
             val cands = if (RimeEngine.traditional) {
                 rawCands.map { HandwritingEngine.toTraditional(applicationContext, it) }.distinct()
             } else rawCands
