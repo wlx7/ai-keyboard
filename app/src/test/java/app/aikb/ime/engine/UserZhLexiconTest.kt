@@ -37,7 +37,6 @@ class UserZhLexiconTest {
 
     @Test
     fun learnsMultiSegmentSelfMadeWordsAndSplitsLongSentences() {
-        // User types `jinse` -> picks `禁` + picks `色`
         UserZhLexicon.learnFromSegmentChain(
             schema = "rime_ice",
             segments = listOf("jin" to "禁", "se" to "色"),
@@ -46,25 +45,39 @@ class UserZhLexiconTest {
 
         val exact = UserZhLexicon.lookup("rime_ice", "jinse")
         assertEquals(listOf("禁色"), exact.topPriority)
-
-        // Initials `js` and incomplete prefix `jins` surface `禁色` in secondary
         assertTrue("禁色" in UserZhLexicon.lookup("rime_ice", "js").secondary)
         assertTrue("禁色" in UserZhLexicon.lookup("rime_ice", "jins").secondary)
 
-        // Long sentence `jinsezheshouge` (or `jin'se'zheshouge`) splits `禁色` + `zheshouge`
+        // Long sentence `jinsezheshouge` splits `("禁色", "zheshouge")`, and `minCompleteSyllables("zheshouge") > 0`!
         val sentenceSplit = UserZhLexicon.lookup("rime_ice", "jinsezheshouge")
         assertEquals(listOf("禁色" to "zheshouge"), sentenceSplit.prefixSplits)
+        val cleanRem = sentenceSplit.prefixSplits.first().second
+        assertTrue(PinyinCorrector.minCompleteSyllables(cleanRem) > 0)
+
         val apostropheSplit = UserZhLexicon.lookup("rime_ice", "jin'se'zheshouge")
         assertEquals(listOf("禁色" to "zheshouge"), apostropheSplit.prefixSplits)
 
-        // Reloading from disk preserves learned words
         UserZhLexicon.loadFromFile(tempFile, force = true)
         assertEquals(listOf("禁色"), UserZhLexicon.lookup("rime_ice", "jinse").topPriority)
     }
 
     @Test
+    fun extractsTwoCharWordAcrossSeamWhenPickingFirstCharThenRimeTail() {
+        // User types `jinsezheshouge`, picks `禁` ("jin"), then picks Rime's #1 `色这首歌` ("sezheshouge")!
+        UserZhLexicon.learnFromSegmentChain(
+            schema = "rime_ice",
+            segments = listOf("jin" to "禁", "sezheshouge" to "色这首歌"),
+            nowMs = 1_500L,
+        )
+        // Must learn BOTH standalone `禁色` ("jinse") AND `禁色这首歌` ("jinsezheshouge")!
+        assertEquals(listOf("禁色"), UserZhLexicon.lookup("rime_ice", "jinse").topPriority)
+        assertEquals(listOf("禁色这首歌"), UserZhLexicon.lookup("rime_ice", "jinsezheshouge").topPriority)
+        // And any brand-new sentence `jinsehaotingma` now splits `("禁色", "haotingma")`!
+        assertEquals(listOf("禁色" to "haotingma"), UserZhLexicon.lookup("rime_ice", "jinsehaotingma").prefixSplits)
+    }
+
+    @Test
     fun stripsClauseParticlesWhenLearningFromSentenceChain() {
-        // User types `woxihuanjinsede` -> `我喜欢` + `禁` + `色` + `的`
         UserZhLexicon.learnFromSegmentChain(
             schema = "rime_ice",
             segments = listOf("woxihuan" to "我喜欢", "jin" to "禁", "se" to "色", "de" to "的"),
@@ -76,7 +89,6 @@ class UserZhLexiconTest {
 
     @Test
     fun learnsConsecutiveSingleCharacterPicksWithinWindow() {
-        // User types `jin` -> picks `禁` (non-default #20), then 2s later types `se` -> presses Space for `色`
         UserZhLexicon.onSingleCharCommit(
             schema = "rime_ice",
             rawCode = "jin",
@@ -89,13 +101,14 @@ class UserZhLexiconTest {
             rawCode = "se",
             charText = "色",
             wasNonDefaultPick = false,
-            nowMs = 12_000L,
+            nowMs = 28_000L, // 18s later (within 25s window)
         )
         assertEquals(listOf("禁色"), UserZhLexicon.lookup("rime_ice", "jinse").topPriority)
     }
 
     @Test
-    fun zeroShotContextLearningSurfacesHomophoneEvenWithEmptyLexicon() {
+    fun zeroShotContextAndSessionPrefixLearningWorksOnLongSentences() {
+        // Exact match from context
         val res = UserZhLexicon.lookup(
             schema = "rime_ice",
             rawInput = "jinse",
@@ -103,6 +116,28 @@ class UserZhLexiconTest {
         )
         assertEquals(listOf("禁色"), res.topPriority)
         assertTrue("禁色" in res.contextSparkleSet)
+
+        // Long-sentence prefix match from sessionMemory even when contextBeforeCursor is empty (e.g. browser search bar!)
+        val longRes = UserZhLexicon.lookup(
+            schema = "rime_ice",
+            rawInput = "jinsezheshouge",
+            contextBeforeCursor = "",
+            sessionMemory = "刚才看到了《禁色》",
+        )
+        assertEquals(listOf("禁色" to "zheshouge"), longRes.prefixSplits)
+        assertTrue("禁色" in longRes.contextSparkleSet)
+    }
+
+    @Test
+    fun incognitoSessionOnlyLearningWorksInRamWithoutTouchingDisk() {
+        UserZhLexicon.learnFromSegmentChain(
+            schema = "rime_ice",
+            segments = listOf("jin" to "禁", "se" to "色"),
+            persist = false,
+            nowMs = 5_000L,
+        )
+        assertEquals(listOf("禁色"), UserZhLexicon.lookup("rime_ice", "jinse").topPriority)
+        assertTrue(!tempFile.exists() || tempFile.length() == 0L)
     }
 
     @Test

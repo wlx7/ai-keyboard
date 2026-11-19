@@ -142,11 +142,13 @@ class ImeService : InputMethodService(),
     private val zhChainSegments = ArrayList<Pair<String, String>>()
     private var zhChainSchema = ""
     private var pendingRimePickRank = 0
+    private var zhSessionHadManualPick = false
 
     private fun resetZhLearningChain() {
         zhChainSegments.clear()
         zhChainSchema = ""
         pendingRimePickRank = 0
+        zhSessionHadManualPick = false
         UserZhLexicon.resetConsecutiveTracker()
     }
 
@@ -182,6 +184,9 @@ class ImeService : InputMethodService(),
             if (!txt.isNullOrBlank()) {
                 if (kbPrefs.clipboardEnabled) {
                     clipboardStore.onCopied(txt)
+                    if (txt.length <= 300 && txt.any(ChinesePredictor::isCjk)) {
+                        AiRanker.remember(txt)
+                    }
                     if (::clipboardPanel.isInitialized && overlay == Overlay.CLIPBOARD) clipboardPanel.refresh()
                 }
                 if (kbPrefs.otpAutoFill) OtpStore.onCandidateText(null, txt, "剪贴板")
@@ -487,10 +492,13 @@ class ImeService : InputMethodService(),
         editorCandStart = candidatesStart
         editorCandEnd = candidatesEnd
         val elapsed = SystemClock.uptimeMillis() - lastEditAt
-        // Ignore WebView/React layout pings where cursor didn't move or candidatesEnd=-1 arrives shortly after our own edit
+        // Ignore WebView/React layout pings where cursor didn't move or candidatesEnd=-1 arrives shortly after our own edit,
+        // and ignore browser Omnibox inline-autocomplete selection (`newSelStart == candidatesEnd && newSelEnd >= candidatesEnd`).
         val cursorUnchanged = oldSelStart == newSelStart && oldSelEnd == newSelEnd
+        val recentOwnEdit = elapsed < 450
         val recentNoSpan = candidatesEnd < 0 && (elapsed < 900 || cursorUnchanged)
-        val userJumpedCursor = !recentNoSpan && (
+        val omniboxAutocomplete = candidatesEnd >= 0 && newSelStart == candidatesEnd && newSelEnd >= candidatesEnd
+        val userJumpedCursor = !recentOwnEdit && !recentNoSpan && !omniboxAutocomplete && (
             (candidatesEnd >= 0 && (newSelStart != candidatesEnd || newSelEnd != candidatesEnd)) ||
             (candidatesEnd < 0 && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 1)
         )
@@ -951,7 +959,7 @@ class ImeService : InputMethodService(),
         commitFormatted(ic, text)
         resetZhLearningChain()
         if (text.any(ChinesePredictor::isCjk)) {
-            if (scene.learn && scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text)
+            if (scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text, persist = scene.learn)
             recordChineseCommit(prevZh, text)
             updateCandidates()
         }
@@ -1408,7 +1416,8 @@ class ImeService : InputMethodService(),
                 }
                 learned.prefixSplits.firstOrNull()?.let { (rawPrefix, remInput) ->
                     val outPrefix = maybeTrad(rawPrefix)
-                    val tailComplete = schema != "rime_ice" || PinyinCorrector.allCompleteSyllables(remInput)
+                    val cleanRem = remInput.lowercase().filter { it in 'a'..'z' || it in '0'..'9' }
+                    val tailComplete = schema != "rime_ice" || PinyinCorrector.minCompleteSyllables(cleanRem) > 0
                     if (tailComplete) {
                         val tailTop = RimeEngine.queryTop(schema, remInput, 1).firstOrNull()
                         if (!tailTop.isNullOrEmpty()) {
@@ -1419,7 +1428,7 @@ class ImeService : InputMethodService(),
                                 directZhCommits += fullOut
                             }
                         }
-                    } else if (outPrefix !in commits) {
+                    } else if (cleanRem.length >= 2 && outPrefix !in commits) {
                         labels += outPrefix
                         commits += outPrefix
                         partialZhPrefixTail[outPrefix] = remInput
@@ -1695,6 +1704,7 @@ class ImeService : InputMethodService(),
             val rimeIndex = zh.candidates.indexOfFirst { it.text == text }.takeIf { it >= 0 } ?: index
             if (aiSuggestion != null) AiRanker.feedback(pickedAi = false, pickedRime = rimeIndex == 0)
             pendingRimePickRank = rimeIndex
+            if (rimeIndex > 0) zhSessionHadManualPick = true
             RimeEngine.select(rimeIndex)
             zhSync()
             return
@@ -1759,6 +1769,7 @@ class ImeService : InputMethodService(),
         val ic = currentInputConnection
         val oldShownLen = if (zhComposing) zhDisplay().length else 0
         val inputBefore = zh.input
+        val defaultFirstBefore = zh.candidates.firstOrNull()?.text.orEmpty()
         val pickRank = pendingRimePickRank
         pendingRimePickRank = 0
         val commit = RimeEngine.takeCommit()
@@ -1767,7 +1778,7 @@ class ImeService : InputMethodService(),
             val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
             commitFormatted(ic, commit, skipBeforeLen = oldShownLen)
             recordChineseCommit(prevZh, commit)
-            if (scene.learn && scene.kind != FieldKind.PASSWORD) {
+            if (scene.kind != FieldKind.PASSWORD) {
                 val schema = RimeEngine.currentSchema() ?: "rime_ice"
                 val remInput = if (zh.composing) zh.input else ""
                 val consumedInput = if (remInput.isNotEmpty() && inputBefore.endsWith(remInput)) {
@@ -1780,32 +1791,48 @@ class ImeService : InputMethodService(),
                     zhChainSchema = schema
                     zhChainSegments += consumedInput to commit
                 }
-                if (!zh.composing) {
+                if (zh.composing) {
+                    if (pickRank > 0) zhSessionHadManualPick = true
+                    // Eagerly learn confirmed multi-segment prefix (e.g. `禁` + `色` while `zheshouge` is still composing!)
+                    // so clearing/backspacing the tail never loses the newly composed word.
                     if (zhChainSegments.size >= 2) {
-                        UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments)
+                        UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments.toList(), persist = scene.learn)
+                    }
+                } else {
+                    if (zhChainSegments.size >= 2) {
+                        UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments, persist = scene.learn)
                     } else if (zhChainSegments.size == 1) {
                         val (cCode, cWord) = zhChainSegments[0]
                         val cpLen = cWord.codePointCount(0, cWord.length)
-                        if (cpLen >= 2 && pickRank > 0) {
-                            UserZhLexicon.learnPhrase(schema, cCode, cWord, boost = 2)
+                        val nonDefaultPhrase = pickRank > 0 || zhSessionHadManualPick ||
+                            (defaultFirstBefore.isNotEmpty() && cWord != defaultFirstBefore)
+                        if (cpLen >= 2 && nonDefaultPhrase) {
+                            UserZhLexicon.learnPhrase(schema, cCode, cWord, boost = 3, persist = scene.learn)
                         } else if (cpLen == 1) {
                             val recentCtx = ic?.getTextBeforeCursor(40, 0)?.toString().orEmpty()
                             UserZhLexicon.onSingleCharCommit(
                                 schema = schema,
                                 rawCode = cCode,
                                 charText = cWord,
-                                wasNonDefaultPick = pickRank >= 1,
+                                wasNonDefaultPick = pickRank >= 1 || zhSessionHadManualPick ||
+                                    (defaultFirstBefore.isNotEmpty() && cWord != defaultFirstBefore),
                                 recentContext = recentCtx,
+                                persist = scene.learn,
                             )
                         } else {
                             UserZhLexicon.resetConsecutiveTracker()
                         }
                     }
                     zhChainSegments.clear()
+                    zhSessionHadManualPick = false
                 }
             }
         } else if (!zh.composing) {
+            if (scene.kind != FieldKind.PASSWORD && zhChainSegments.size >= 2) {
+                UserZhLexicon.learnFromSegmentChain(zhChainSchema.ifEmpty { "rime_ice" }, zhChainSegments, persist = scene.learn)
+            }
             zhChainSegments.clear()
+            zhSessionHadManualPick = false
         }
         if (zh.input != aiInput) {
             aiSuggestion = null
@@ -1858,7 +1885,15 @@ class ImeService : InputMethodService(),
             aiWorker.execute {
                 try {
                     if (gen != aiGeneration.get() || !AiRanker.ensureLoaded(applicationContext)) return@execute
-                    val learnedExtras = UserZhLexicon.lookup(schema, input, context, AiRanker.sessionMemory()).topPriority
+                    val learned = UserZhLexicon.lookup(schema, input, context, AiRanker.sessionMemory())
+                    val learnedExtras = buildList {
+                        addAll(learned.topPriority)
+                        for ((prefWord, rem) in learned.prefixSplits) {
+                            for (tail in RimeEngine.queryTop(schema, rem, 2)) {
+                                if (tail.isNotEmpty()) add(prefWord + tail)
+                            }
+                        }
+                    }
                     val s = AiRanker.suggest(context, schema, input, syllables, extraCandidates = learnedExtras) {
                         gen != aiGeneration.get()
                     } ?: return@execute
@@ -1888,10 +1923,13 @@ class ImeService : InputMethodService(),
         val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
         val curSchema = RimeEngine.currentSchema() ?: "rime_ice"
         val consumed = if (zh.input.length > remTail.length) zh.input.dropLast(remTail.length) else ""
-        if (scene.learn && scene.kind != FieldKind.PASSWORD && consumed.isNotEmpty() && text.all(ChinesePredictor::isCjk)) {
+        if (scene.kind != FieldKind.PASSWORD && consumed.isNotEmpty() && text.all(ChinesePredictor::isCjk)) {
             if (zhChainSchema != curSchema) zhChainSegments.clear()
             zhChainSchema = curSchema
             zhChainSegments += consumed to text
+            if (zhChainSegments.size >= 2) {
+                UserZhLexicon.learnFromSegmentChain(curSchema, zhChainSegments.toList(), persist = scene.learn)
+            }
         }
         commitFormatted(ic, text, skipBeforeLen = oldShownLen)
         recordChineseCommit(prevZh, text)
@@ -1920,15 +1958,16 @@ class ImeService : InputMethodService(),
         aiSuggestion = null
         aiRunnerUp = null
         commitFormatted(currentInputConnection, text, skipBeforeLen = oldShownLen)
-        if (scene.learn && scene.kind != FieldKind.PASSWORD && inputBefore.isNotEmpty() && text.all(ChinesePredictor::isCjk)) {
+        if (scene.kind != FieldKind.PASSWORD && inputBefore.isNotEmpty() && text.all(ChinesePredictor::isCjk)) {
             if (zhChainSegments.isNotEmpty() && zhChainSchema == schema) {
                 zhChainSegments += inputBefore to text
-                UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments)
+                UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments, persist = scene.learn)
             } else {
-                UserZhLexicon.learnPhrase(schema, inputBefore, text, boost = 2)
+                UserZhLexicon.learnPhrase(schema, inputBefore, text, boost = 3, persist = scene.learn)
             }
         }
         zhChainSegments.clear()
+        zhSessionHadManualPick = false
         if (pickedAi) AiRanker.feedback(pickedAi = true, pickedRime = false)
         recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
@@ -1998,7 +2037,7 @@ class ImeService : InputMethodService(),
         hwCandidates = emptyList()
         handwriting.hasPendingComposition = false
         commitFormatted(currentInputConnection, top, skipBeforeLen = top.length)
-        if (scene.learn && scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(top)
+        if (scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(top, persist = scene.learn)
         recordChineseCommit(prevZh, top)
         updateCandidates()
     }
@@ -2060,7 +2099,7 @@ class ImeService : InputMethodService(),
             handwriting.hasPendingComposition = false
         }
         commitFormatted(currentInputConnection, text, skipBeforeLen = oldTopLen)
-        if (scene.learn && scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text)
+        if (scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text, persist = scene.learn)
         recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
         updateCandidates()
@@ -2119,6 +2158,7 @@ class ImeService : InputMethodService(),
         }
         val rimeIndex = RimeEngine.snapshot(300).candidates.indexOfFirst { it.text == text }.takeIf { it >= 0 } ?: index
         pendingRimePickRank = rimeIndex
+        if (rimeIndex > 0) zhSessionHadManualPick = true
         RimeEngine.select(rimeIndex)
         zhSync()
         setOverlay(Overlay.NONE)

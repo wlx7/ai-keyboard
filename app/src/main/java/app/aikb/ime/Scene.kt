@@ -79,7 +79,7 @@ data class Scene(
                         InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS ->
                             Scene(FieldKind.EMAIL, action, true, false, false, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_URI ->
-                            Scene(FieldKind.URL, action, true, false, false, false, rawAction = rawAction)
+                            Scene(FieldKind.URL, action, true, false, false, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_PASSWORD,
                         InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD,
                         InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ->
@@ -87,7 +87,7 @@ data class Scene(
                         InputType.TYPE_TEXT_VARIATION_PERSON_NAME ->
                             Scene(FieldKind.PERSON_NAME, action, !noSuggest, false, true, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_FILTER ->
-                            Scene(FieldKind.TEXT, action, !noSuggest, false, false, false, rawAction = rawAction, multiLine = multiLine)
+                            Scene(FieldKind.TEXT, action, !noSuggest, false, false, !incognito, rawAction = rawAction, multiLine = multiLine)
                         else -> Scene(
                             FieldKind.TEXT, action, !noSuggest, autoCorrect = !noSuggest,
                             autoCaps = caps, learn = !incognito, rawAction = rawAction, multiLine = multiLine,

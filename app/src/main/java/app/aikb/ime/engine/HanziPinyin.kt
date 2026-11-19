@@ -107,7 +107,8 @@ object HanziPinyin {
     /** True iff [word]'s characters (accounting for polyphones) concatenate exactly to [targetPinyin]. */
     fun matchesPinyin(word: String, targetPinyin: String): Boolean {
         if (word.isEmpty() || targetPinyin.isEmpty()) return false
-        return matchRec(word, 0, targetPinyin, 0)
+        val clean = targetPinyin.lowercase().filter { it in 'a'..'z' }
+        return clean.isNotEmpty() && matchRec(word, 0, clean, 0)
     }
 
     private fun matchRec(word: String, wIdx: Int, target: String, tIdx: Int): Boolean {
@@ -122,6 +123,70 @@ object HanziPinyin {
             }
         }
         return false
+    }
+
+    /**
+     * Aligns each character in [word] to its matching syllable slice in [targetPinyin].
+     * Example: `alignWordToPinyin("色这首歌", "sezheshouge")` -> `[("se","色"), ("zhe","这"), ("shou","首"), ("ge","歌")]`.
+     */
+    fun alignWordToPinyin(word: String, targetPinyin: String): List<Pair<String, String>>? {
+        if (!isLoaded || word.isEmpty() || targetPinyin.isEmpty()) return null
+        val clean = targetPinyin.lowercase().filter { it in 'a'..'z' }
+        if (clean.isEmpty()) return null
+        val out = ArrayList<Pair<String, String>>(word.length)
+        return if (alignRec(word, 0, clean, 0, out)) out else null
+    }
+
+    private fun alignRec(
+        word: String,
+        wIdx: Int,
+        target: String,
+        tIdx: Int,
+        out: MutableList<Pair<String, String>>,
+    ): Boolean {
+        if (wIdx == word.length) return tIdx == target.length
+        if (tIdx >= target.length) return false
+        val cp = word.codePointAt(wIdx)
+        val readings = table[cp] ?: return false
+        val charStr = String(Character.toChars(cp))
+        val nextW = wIdx + Character.charCount(cp)
+        for (py in readings) {
+            if (target.startsWith(py, tIdx)) {
+                out.add(py to charStr)
+                if (alignRec(word, nextW, target, tIdx + py.length, out)) return true
+                out.removeAt(out.lastIndex)
+            }
+        }
+        return false
+    }
+
+    /**
+     * If [word] matches a strict prefix of [cleanFullPinyin] and the remaining suffix is a valid
+     * Mandarin syllable sequence (or mid-typing initial), returns the matched prefix length; else -1.
+     */
+    fun prefixMatchLength(word: String, cleanFullPinyin: String): Int {
+        if (!isLoaded || word.isEmpty() || cleanFullPinyin.length < 4) return -1
+        return prefixRec(word, 0, cleanFullPinyin, 0)
+    }
+
+    private fun prefixRec(word: String, wIdx: Int, full: String, fIdx: Int): Int {
+        if (wIdx == word.length) {
+            if (fIdx <= 0 || fIdx >= full.length) return -1
+            val rem = full.substring(fIdx)
+            val validRem = PinyinCorrector.minCompleteSyllables(rem) > 0 || PinyinCorrector.isMidTypingInitial(rem)
+            return if (validRem) fIdx else -1
+        }
+        if (fIdx >= full.length) return -1
+        val cp = word.codePointAt(wIdx)
+        val readings = table[cp] ?: return -1
+        val nextW = wIdx + Character.charCount(cp)
+        for (py in readings) {
+            if (full.startsWith(py, fIdx)) {
+                val r = prefixRec(word, nextW, full, fIdx + py.length)
+                if (r > 0) return r
+            }
+        }
+        return -1
     }
 
     /**
@@ -159,6 +224,55 @@ object HanziPinyin {
                 val candidate = sb.toString()
                 if (candidate !in found && matchesPinyin(candidate, cleanTarget)) {
                     found += candidate
+                    if (found.size >= maxResults) return found
+                }
+            }
+        }
+        return found
+    }
+
+    /**
+     * Scans [text] from newest to oldest for contiguous 2..[maxChars] CJK phrases whose Pinyin
+     * matches a prefix of [fullPinyin] (e.g. finds `("禁色", 5)` in `"《禁色》..."` when typing `"jinsezheshouge"`).
+     */
+    fun extractPrefixMatches(
+        text: String,
+        fullPinyin: String,
+        maxChars: Int = 5,
+        maxResults: Int = 2,
+    ): List<Pair<String, Int>> {
+        if (!isLoaded || text.length < 2 || fullPinyin.length < 5) return emptyList()
+        val cleanFull = fullPinyin.lowercase().filter { it in 'a'..'z' }
+        if (cleanFull.length < 5) return emptyList()
+
+        val cps = ArrayList<Int>(text.length)
+        var idx = 0
+        while (idx < text.length) {
+            val cp = text.codePointAt(idx)
+            cps += cp
+            idx += Character.charCount(cp)
+        }
+        if (cps.size < 2) return emptyList()
+
+        val found = ArrayList<Pair<String, Int>>(maxResults)
+        for (start in (cps.size - 2) downTo 0) {
+            val firstReadings = table[cps[start]] ?: continue
+            if (firstReadings.none { cleanFull.startsWith(it) }) continue
+
+            val maxSpan = minOf(maxChars, cps.size - start)
+            for (span in maxSpan downTo 2) {
+                var allCjk = true
+                for (k in 0 until span) {
+                    if (!table.containsKey(cps[start + k])) { allCjk = false; break }
+                }
+                if (!allCjk) continue
+                val sb = StringBuilder(span * 2)
+                for (k in 0 until span) sb.appendCodePoint(cps[start + k])
+                val candidate = sb.toString()
+                if (found.any { it.first == candidate }) continue
+                val pLen = prefixMatchLength(candidate, cleanFull)
+                if (pLen >= 4) {
+                    found += candidate to pLen
                     if (found.size >= maxResults) return found
                 }
             }

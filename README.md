@@ -6,18 +6,18 @@ Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET`，从
 
 ---
 
-## 下载安装（Release v2.4.0）
+## 下载安装（Release v2.5.0）
 
 前往 [**Releases 页面**](https://github.com/wlx7/ai-keyboard/releases/latest) 按需选择下载：
 
-1. **🌟 `keylo-2.4.0-arm64.apk`（内置 AI 完整旗舰版，主力推荐）**
+1. **🌟 `keylo-2.5.0-arm64.apk`（内置 AI 完整旗舰版，主力推荐）**
    - 直接将专属蒸馏模型 **`Keylo-285M Q4_0`（`154.5 MiB`）**、**233 万条中文大词库**、**23.3 万英文词库**、**4 万字全生僻字手写引擎** 与 **`sherpa-onnx` 流式离线语音模型** 全部内嵌于安装包中，**安装即享完整 AI 选句，无需手动下载或导入模型文件**（包名兼容旧版，可直接覆盖升级）。
-2. **⚡ `keylo-2.4.0-lite-arm64.apk`（精简外挂版，约 `86.8 MiB`）**
+2. **⚡ `keylo-2.5.0-lite-arm64.apk`（精简外挂版，约 `86.8 MiB`）**
    - 包含除内置 `.gguf` 外的全部词库、离线语音与全生僻字手写功能；可按需下载 `.gguf` 模型在设置中导入。
 
 ---
 
-## v2.4 核心特性一览
+## v2.5 核心特性一览
 
 - **全链路实时自学习词库与上下文零样本学词（`UserZhLexicon` + `HanziPinyin`）**
   - **分段组词与单字连打记忆**：无论在连拼中逐段选字（如 `jinse` 选 `禁` + `色`、或在整句 `woxihuanjinsede` 中选字自动剥离虚词学得 `禁色`），还是分开逐字选字（`jin` 选 `禁` 后紧接 `se` 选 `色`），均立即写入本地持久化自学习词库，下次输入 `jinse`、简拼 `js`、前缀 `jins` 或整句 `jinsezheshouge` 直接置顶首选（`✦ 禁色这首歌`）。

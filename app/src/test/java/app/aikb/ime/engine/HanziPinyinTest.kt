@@ -38,12 +38,19 @@ class HanziPinyinTest {
     }
 
     @Test
-    fun extractsContextHomophonesFromLiveChatText() {
+    fun alignsMultiCharSegmentAndExtractsLongSentencePrefixes() {
+        assertEquals(
+            listOf("se" to "色", "zhe" to "这", "shou" to "首", "ge" to "歌"),
+            HanziPinyin.alignWordToPinyin("色这首歌", "sezheshouge"),
+        )
+
         val chatContext = "《禁色》这首歌是不是说同性恋的？是的，达明一派的《禁色》确实是代表作。"
         assertEquals(listOf("禁色"), HanziPinyin.extractMatchingPhrases(chatContext, "jinse"))
         assertEquals(listOf("达明一派"), HanziPinyin.extractMatchingPhrases(chatContext, "damingyipai"))
 
-        // Exact 2-char prefix right before cursor (`禁色jin se|`)
-        assertEquals(listOf("禁色"), HanziPinyin.extractMatchingPhrases("禁色", "jinse"))
+        // Prefix extraction when user types a long sentence `jinsezheshouge`
+        assertEquals(listOf("禁色" to 5), HanziPinyin.extractPrefixMatches(chatContext, "jinsezheshouge"))
+        // Must reject broken syllable boundary (`jin` vs `jing` leaving `gse...`)
+        assertEquals(-1, HanziPinyin.prefixMatchLength("金色", "jingsezheshouge"))
     }
 }
