@@ -338,10 +338,15 @@ JNI_FN(jfloatArray, nativeScore)(JNIEnv* env, jobject, jstring context, jobjectA
 JNI_FN(void, nativeAbort)(JNIEnv*, jobject) { g_abort = true; }
 
 /**
- * Generates up to [maxOut] context-aware multi-character Chinese continuations given the full
- * sentence [context] before cursor, sharing seq 0 KV cache with nativeScore (~6-12 ms).
+ * Proposes up to [maxOut] next-word continuations for the full sentence [context] before the cursor.
+ *
+ * Only WHOLE multi-character vocabulary tokens (2..4 Hanzi) are returned: stitching a single character
+ * onto the next token produced non-words ("夫在", "和马", "在哪个"). A strict confidence floor
+ * (log P >= kPredictMinLp) keeps the model silent when it does not know (names, idioms, short tails),
+ * so the dictionary answers instead. Reuses seq 0's cached logits: no extra decode, ~1 ms after sync.
  */
 JNI_FN(jobjectArray, nativePredict)(JNIEnv* env, jobject, jstring context, jint maxOut) {
+    constexpr float kPredictMinLp = -3.3f;
     std::lock_guard<std::mutex> lock(g_lock);
     if (!g_ctx || maxOut <= 0 || g_tokCjkLen.empty()) return nullptr;
     g_abort = false;
@@ -353,101 +358,26 @@ JNI_FN(jobjectArray, nativePredict)(JNIEnv* env, jobject, jstring context, jint 
     if ((int) ctxTok.size() > kCtx - 16) ctxTok.erase(ctxTok.begin() + 1, ctxTok.end() - (kCtx - 16 - 1));
     if (!syncContext(ctxTok) || g_abort.load() || g_lastLogProbs.empty()) return nullptr;
 
-    const int nVocab = (int) g_tokCjkLen.size();
     struct TokScore { llama_token tok; float lp; };
-    std::vector<TokScore> top1;
-    top1.reserve(10);
+    std::vector<TokScore> top;
+    const int nVocab = (int) g_tokCjkLen.size();
+    const int cap = std::min<int>(maxOut, 6);
     for (int t = 0; t < nVocab; ++t) {
-        if (g_tokCjkLen[t] == 0) continue;
-        float lp = g_lastLogProbs[t];
-        if (lp < -5.2f) continue;
-        if (top1.size() < 8) {
-            top1.push_back({t, lp});
-            std::sort(top1.begin(), top1.end(), [](const TokScore& a, const TokScore& b) { return a.lp > b.lp; });
-        } else if (lp > top1.back().lp) {
-            top1.back() = {t, lp};
-            std::sort(top1.begin(), top1.end(), [](const TokScore& a, const TokScore& b) { return a.lp > b.lp; });
-        }
+        const uint8_t clen = g_tokCjkLen[t];
+        if (clen < 2 || clen > 4) continue;
+        const float lp = g_lastLogProbs[t];
+        if (lp < kPredictMinLp) continue;
+        top.push_back({t, lp});
     }
+    if (top.empty()) return nullptr;
+    std::sort(top.begin(), top.end(), [](const TokScore& a, const TokScore& b) { return a.lp > b.lp; });
+    if ((int) top.size() > cap) top.resize(cap);
 
-    struct PredCand { std::string text; float score; };
-    std::vector<PredCand> cands;
-    std::vector<TokScore> expand;
-    for (const auto& ts : top1) {
-        uint8_t clen = g_tokCjkLen[ts.tok];
-        if (clen >= 2 && clen <= 4 && ts.lp >= -4.5f) {
-            cands.push_back({g_tokPiece[ts.tok], ts.lp});
-        }
-        if ((int) expand.size() < 4) {
-            if ((clen == 1 && ts.lp >= -4.5f && !g_tokIsParticle[ts.tok]) ||
-                (clen == 2 && ts.lp >= -2.6f)) {
-                expand.push_back(ts);
-            }
-        }
-    }
-
-    if (!expand.empty() && !g_abort.load()) {
-        llama_memory_t mem = llama_get_memory(g_ctx);
-        const llama_pos base = (llama_pos) ctxTok.size();
-        llama_batch batch = llama_batch_init((int) expand.size(), 0, 1);
-        for (size_t b = 0; b < expand.size(); ++b) {
-            llama_memory_seq_cp(mem, 0, (llama_seq_id) (b + 1), 0, base);
-            int k = batch.n_tokens++;
-            batch.token[k] = expand[b].tok;
-            batch.pos[k] = base;
-            batch.n_seq_id[k] = 1;
-            batch.seq_id[k][0] = (llama_seq_id) (b + 1);
-            batch.logits[k] = true;
-        }
-        bool ok = llama_decode(g_ctx, batch) == 0;
-        if (ok && !g_abort.load()) {
-            for (size_t b = 0; b < expand.size(); ++b) {
-                const float* logits = llama_get_logits_ith(g_ctx, (int32_t) b);
-                const float lse = logSumExp(logits, nVocab);
-                const uint8_t len1 = g_tokCjkLen[expand[b].tok];
-                const float lp1 = expand[b].lp;
-                for (int t2 = 0; t2 < nVocab; ++t2) {
-                    uint8_t len2 = g_tokCjkLen[t2];
-                    if (len2 == 0 || g_tokIsParticle[t2]) continue;
-                    float lp2 = logits[t2] - lse;
-                    if (len1 == 1 && (len2 == 1 || len2 == 2) && lp2 >= -3.6f) {
-                        float sc = (lp1 + lp2) / 1.60f;
-                        if (sc >= -4.4f) {
-                            cands.push_back({g_tokPiece[expand[b].tok] + g_tokPiece[t2], sc});
-                        }
-                    } else if (len1 == 2 && len2 == 2 && (lp1 + lp2) >= -4.2f) {
-                        cands.push_back({g_tokPiece[expand[b].tok] + g_tokPiece[t2], (lp1 + lp2) / 1.55f});
-                    }
-                }
-            }
-        }
-        llama_batch_free(batch);
-        for (size_t b = 0; b < expand.size(); ++b) {
-            llama_memory_seq_rm(mem, (llama_seq_id) (b + 1), -1, -1);
-        }
-    }
-
-    if (cands.empty()) return nullptr;
-    std::sort(cands.begin(), cands.end(), [](const PredCand& a, const PredCand& b) { return a.score > b.score; });
-
-    std::vector<std::string> unique;
-    const int cap = std::min<int>(maxOut, 8);
-    for (const auto& c : cands) {
-        bool dup = false;
-        for (const auto& u : unique) {
-            if (u == c.text) { dup = true; break; }
-        }
-        if (!dup) {
-            unique.push_back(c.text);
-            if ((int) unique.size() >= cap) break;
-        }
-    }
-
-    LOGI("predict: ctx %zu tok -> %zu cands in %.1f ms", ctxTok.size(), unique.size(), nowMs() - t0);
+    LOGI("predict: ctx %zu tok -> %zu words (best %.2f) in %.1f ms", ctxTok.size(), top.size(), top[0].lp, nowMs() - t0);
     jclass strCls = env->FindClass("java/lang/String");
-    jobjectArray arr = env->NewObjectArray((jsize) unique.size(), strCls, nullptr);
-    for (size_t i = 0; i < unique.size(); ++i) {
-        jstring js = toJava(env, unique[i]);
+    jobjectArray arr = env->NewObjectArray((jsize) top.size(), strCls, nullptr);
+    for (size_t i = 0; i < top.size(); ++i) {
+        jstring js = toJava(env, g_tokPiece[top[i].tok]);
         env->SetObjectArrayElement(arr, (jsize) i, js);
         env->DeleteLocalRef(js);
     }

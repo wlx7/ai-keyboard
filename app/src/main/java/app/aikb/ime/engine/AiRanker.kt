@@ -307,7 +307,12 @@ object AiRanker {
         raw: List<String>,
         max: Int = 2,
     ): List<String> {
-        val recentTail = ctx.takeLast(12)
+        // Echo guard within the current sentence only: `这个问题怎么 → 怎么` / `…漏洞，需要马上 → 漏洞` are
+        // dropped, but `你吃饭了吗？我还在 → 吃饭` (new sentence after `？`) is kept.
+        val recentTail = ctx.takeLast(12).let { t ->
+            val cut = t.indexOfLast { it in "。！？!?\n" }
+            if (cut >= 0) t.substring(cut + 1) else t
+        }
         val out = ArrayList<String>(max)
         for (cand in raw) {
             val cpLen = cand.codePointCount(0, cand.length)

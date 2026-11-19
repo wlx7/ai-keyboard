@@ -88,5 +88,16 @@ class ChinesePredictorTest {
             max = 3,
         )
         assertEquals(listOf("修改", "修复", "解决"), filtered)
+
+        assertEquals(
+            "Echo of the current sentence's last word must be dropped",
+            emptyList<String>(),
+            AiRanker.filterAiNextPredictions("这个问题怎么", listOf("怎么"), max = 2),
+        )
+        assertEquals(
+            "A word from the PREVIOUS sentence is a legitimate continuation",
+            listOf("吃饭"),
+            AiRanker.filterAiNextPredictions("你吃饭了吗？我还在", listOf("吃饭"), max = 2),
+        )
     }
 }
