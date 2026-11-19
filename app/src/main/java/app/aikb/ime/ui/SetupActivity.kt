@@ -40,17 +40,26 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import app.aikb.ime.ImeService
 import app.aikb.ime.OtpNotificationService
 import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.AutoSpacer
 import app.aikb.ime.engine.ChinesePredictor
+import app.aikb.ime.engine.EmojiPredictor
+import app.aikb.ime.engine.EnglishDictionary
+import app.aikb.ime.engine.EnglishEngine
 import app.aikb.ime.engine.HandwritingEngine
 import app.aikb.ime.engine.PersonalDictionary
 import app.aikb.ime.engine.RecentImageStore
@@ -97,9 +106,13 @@ class SetupActivity : ComponentActivity() {
         enableEdgeToEdge()
         imagePermGranted = RecentImageStore.hasImagePermission(this)
         otpNotifGranted = OtpNotificationService.isNotificationAccessEnabled(this)
+        RimeEngine.start(this, prefsSchema())
         setContent { AppTheme { Screen() } }
         handlePermissionExtras(intent)
     }
+
+    private fun prefsSchema(): String? =
+        getSharedPreferences(ImeService.PREFS, Context.MODE_PRIVATE).getString(ImeService.KEY_SCHEMA, "rime_ice")
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -335,7 +348,7 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v2.2 Flagship Offline", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v2.3 Flagship Offline", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
@@ -352,8 +365,10 @@ class SetupActivity : ComponentActivity() {
 
 /**
  * Sticky bottom WYSIWYG live keyboard preview dock:
- * renders the exact Canvas `PreeditBar` + `CandidateBar` + (`KeyboardView` | `HandwritingView` | `T9View`)
- * so every slider/switch adjustment in settings is immediately visible at 60/120fps without blind tuning!
+ *   1. Shows a coherent simulated input strip (`上文 + 当前预编辑`) right above the keyboard so
+ *      preedit, candidates, and context match 1:1 with zero visual disconnect.
+ *   2. Directly interactive: tapping keys or drawing handwriting strokes runs the real offline
+ *      Rime / English / Handwriting / Pangu-spacing / Emoji-prediction engines live!
  */
 @Composable
 private fun LiveKeyboardPreviewDock(
@@ -364,12 +379,17 @@ private fun LiveKeyboardPreviewDock(
     onModeChange: (PreviewMode) -> Unit,
     onToggleExpanded: () -> Unit,
 ) {
+    var simCommitted by remember { mutableStateOf("秋水") }
+    var simComposing by remember { mutableStateOf("shi zhi") }
+    var isCustomSession by remember { mutableStateOf(false) }
+    var resetSeq by remember { mutableStateOf(0) }
+
     Column(
         Modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surface),
     ) {
-        HorizontalDivider(thickness = 0.8.dp, color = Secondary().copy(alpha = 0.28f))
+        HorizontalDivider(thickness = 0.8.dp, color = Secondary().copy(alpha = 0.25f))
         Row(
             Modifier
                 .fillMaxWidth()
@@ -377,8 +397,8 @@ private fun LiveKeyboardPreviewDock(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "实时键盘预览",
-                fontSize = 12.5.sp,
+                "实时预览",
+                fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface,
             )
@@ -397,7 +417,7 @@ private fun LiveKeyboardPreviewDock(
                                 else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
                             )
                             .clickable { onModeChange(m) }
-                            .padding(horizontal = 9.dp, vertical = 3.5.dp),
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
                     ) {
                         Text(
                             m.label,
@@ -412,7 +432,7 @@ private fun LiveKeyboardPreviewDock(
                 Modifier
                     .clip(RoundedCornerShape(50))
                     .clickable(onClick = onToggleExpanded)
-                    .padding(horizontal = 8.dp, vertical = 3.5.dp),
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
             ) {
                 Text(
                     if (expanded) "收起 ⌄" else "展开预览 ▲",
@@ -424,9 +444,72 @@ private fun LiveKeyboardPreviewDock(
         }
 
         if (expanded) {
+            // Coherent simulated input field showing exact committed context + underlined composing span
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 12.dp, bottom = 6.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.055f))
+                    .padding(horizontal = 11.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val primaryColor = MaterialTheme.colorScheme.primary
+                val annotated = buildAnnotatedString {
+                    append(simCommitted)
+                    if (simComposing.isNotEmpty()) {
+                        withStyle(
+                            SpanStyle(
+                                color = primaryColor,
+                                textDecoration = TextDecoration.Underline,
+                                fontWeight = FontWeight.Medium,
+                            ),
+                        ) {
+                            append(simComposing)
+                        }
+                    }
+                    withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Bold)) {
+                        append("▏")
+                    }
+                }
+                Text(
+                    text = annotated,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                if (isCustomSession) {
+                    Text(
+                        "重置示例",
+                        fontSize = 11.5.sp,
+                        color = primaryColor,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { resetSeq++ }
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                } else {
+                    Text(
+                        "可直接按键试打",
+                        fontSize = 11.sp,
+                        color = Secondary(),
+                    )
+                }
+            }
+
             AndroidView(
-                factory = { ctx -> PreviewKeyboardHostView(ctx) },
-                update = { view -> view.bind(kbPrefs, mode, lastChangedKey) },
+                factory = { ctx ->
+                    PreviewKeyboardHostView(ctx) { committed, composing, custom ->
+                        simCommitted = committed
+                        simComposing = composing
+                        isCustomSession = custom
+                    }
+                },
+                update = { view -> view.bind(kbPrefs, mode, lastChangedKey, resetSeq) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .wrapContentHeight(),
@@ -436,12 +519,17 @@ private fun LiveKeyboardPreviewDock(
 }
 
 /**
- * Standalone Canvas host mirroring `ImeService.onCreateInputView()` 1:1 for live preview & tactile testing.
+ * Interactive Canvas host mirroring `ImeService.onCreateInputView()` 1:1:
+ *   - Default showcase pairs context `"秋水"` + preedit `"shi zhi"` -> `["✦ 时至", "是指", "实质", "市值", "食指"]`.
+ *   - Tapping keys or handwriting strokes drives real `RimeEngine` / `EnglishEngine` / `HandwritingEngine` live!
  */
-private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
+private class PreviewKeyboardHostView(
+    context: Context,
+    private val onSimState: (committed: String, composing: String, isCustom: Boolean) -> Unit,
+) : FrameLayout(context) {
     private val previewOverlay = PreviewOverlay(context)
     private val preeditBar = PreeditBar(context)
-    private val candidateBar = CandidateBar(context) { _ -> triggerPreviewHaptic() }
+    private val candidateBar = CandidateBar(context) { idx -> onPickCandidate(idx) }
     private val column: LinearLayout
     private val keyboardView: KeyboardView
     private val handwritingView: HandwritingView
@@ -449,9 +537,32 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
 
     private var currentPrefs = KeyboardPrefs()
     private var currentMode = PreviewMode.KEYBOARD
+    private var lastResetSeq = 0
+    private var lastHandledKey: String? = null
     private var previewChinese = true
     private var previewPage = Page.LETTERS
     private var previewShift = ShiftState.OFF
+
+    // Live interactive state
+    private var userInteractive = false
+    private var simCommitted = "秋水"
+    private val rawInput = StringBuilder()
+    private var currentCandidates: List<String> = emptyList()
+    private var currentCommits: List<String> = emptyList()
+    private var lastSpaceMs = 0L
+
+    private val enEngine: EnglishEngine? by lazy {
+        runCatching {
+            EnglishEngine(
+                EnglishDictionary.load(context),
+                UserHistory(context.filesDir.resolve("en_user.tsv")),
+            )
+        }.getOrNull()
+    }
+    private val zhPredictor: ChinesePredictor? by lazy {
+        runCatching { ChinesePredictor.load(context, context.filesDir.resolve("zh_user.tsv")) }.getOrNull()
+    }
+    private val bgWorker = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
@@ -488,8 +599,157 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         }
     }
 
+    private fun enterInteractiveIfNeeded(clearShowcase: Boolean = true) {
+        if (!userInteractive) {
+            userInteractive = true
+            if (clearShowcase) simCommitted = ""
+            rawInput.clear()
+        }
+    }
+
+    private fun appendFormattedCommit(text: String) {
+        if (text.isEmpty()) return
+        val formatted = AutoSpacer.formatCommit(
+            simCommitted,
+            text,
+            currentPrefs.spaceCnEn,
+            currentPrefs.spaceCnNum,
+        )
+        simCommitted = (simCommitted + formatted).takeLast(36)
+    }
+
+    private fun onPickCandidate(idx: Int) {
+        triggerPreviewHaptic()
+        val picked = currentCommits.getOrNull(idx)?.takeIf { it.isNotEmpty() } ?: return
+        if (!userInteractive) {
+            userInteractive = true
+        }
+        rawInput.clear()
+        handwritingView.clearCanvas(notify = false)
+        appendFormattedCommit(picked)
+        if (!previewChinese) simCommitted += " "
+        refreshInteractiveCandidates(showPostPredict = true)
+    }
+
+    private fun formatSpelledPinyin(s: String): String {
+        if (s.isEmpty()) return ""
+        // Segment cleanly into readable syllables for PreeditBar
+        val out = ArrayList<String>()
+        var i = 0
+        while (i < s.length) {
+            var matched = 1
+            for (len in minOf(6, s.length - i) downTo 1) {
+                val sub = s.substring(i, i + len)
+                if (PinyinCorrectorPlaceholder.isComplete(sub)) {
+                    matched = len
+                    break
+                }
+            }
+            out += s.substring(i, i + matched)
+            i += matched
+        }
+        return out.joinToString(" ")
+    }
+
+    private object PinyinCorrectorPlaceholder {
+        fun isComplete(s: String): Boolean = app.aikb.ime.engine.PinyinCorrector.minCompleteSyllables(s) == 1
+    }
+
+    private fun refreshInteractiveCandidates(showPostPredict: Boolean = false) {
+        candidateBar.freshOtpCode = null
+        if (rawInput.isNotEmpty()) {
+            val typed = rawInput.toString()
+            if (previewChinese) {
+                val spelled = formatSpelledPinyin(typed)
+                preeditBar.text = spelled
+                val cands = if (RimeEngine.isReady) {
+                    RimeEngine.queryTop("rime_ice", typed, maxCands = 6).ifEmpty { listOf(typed) }
+                } else {
+                    listOf(typed)
+                }
+                currentCandidates = cands
+                currentCommits = cands
+                candidateBar.expandable = cands.size > 3
+                candidateBar.setItems(cands, 0)
+                onSimState(simCommitted, spelled, true)
+            } else {
+                preeditBar.text = ""
+                val r = enEngine?.suggest(typed)
+                val labels = ArrayList<String>()
+                val commits = ArrayList<String>()
+                val auto = if (currentPrefs.autoCorrect) r?.autoCorrect else null
+                var hi = 0
+                if (auto != null) {
+                    labels += "“$typed”"; commits += typed
+                    labels += auto; commits += auto; hi = 1
+                } else {
+                    labels += typed; commits += typed
+                }
+                r?.suggestions?.forEach { s ->
+                    if (s.text != typed && s.text != auto && labels.size < 6) {
+                        labels += s.text; commits += s.text
+                    }
+                }
+                currentCandidates = labels
+                currentCommits = commits
+                candidateBar.expandable = false
+                candidateBar.setItems(labels, hi)
+                onSimState(simCommitted, typed, true)
+            }
+            return
+        }
+
+        preeditBar.text = ""
+        if (showPostPredict && currentPrefs.postCommitPredict && simCommitted.isNotEmpty()) {
+            val emojis = if (previewChinese) EmojiPredictor.predictForChinese(simCommitted)
+            else EmojiPredictor.predictForEnglish(simCommitted.trim().substringAfterLast(' '))
+            val words = if (previewChinese) zhPredictor?.predict(simCommitted, max = 5).orEmpty()
+            else enEngine?.predictNext(simCommitted.trim().substringAfterLast(' '), max = 5).orEmpty()
+            val merged = buildList {
+                emojis.firstOrNull()?.let { add(it) }
+                words.forEachIndexed { i, w ->
+                    if (w !in this) add(w)
+                    if (i == 0 && emojis.size > 1 && emojis[1] !in this) add(emojis[1])
+                }
+            }
+            currentCandidates = merged
+            currentCommits = merged
+            candidateBar.expandable = false
+            candidateBar.setItems(merged, -1)
+        } else {
+            currentCandidates = emptyList()
+            currentCommits = emptyList()
+            candidateBar.expandable = false
+            candidateBar.setItems(emptyList(), -1)
+        }
+        onSimState(simCommitted, "", true)
+    }
+
     private val kbListener = object : KeyboardView.Listener {
-        override fun onText(key: Key, text: String) = Unit
+        override fun onText(key: Key, text: String) {
+            enterInteractiveIfNeeded(clearShowcase = true)
+            if (previewPage == Page.LETTERS && text.length == 1 && text[0].isLetter()) {
+                val ch = if (previewChinese) text[0].lowercaseChar() else text[0]
+                if (!previewChinese && rawInput.isEmpty() && AutoSpacer.needsLeadingSpace(simCommitted, ch, currentPrefs.spaceCnEn, currentPrefs.spaceCnNum)) {
+                    simCommitted += " "
+                }
+                rawInput.append(ch)
+                if (previewShift == ShiftState.ONCE) {
+                    previewShift = ShiftState.OFF
+                    keyboardView.shift = previewShift
+                }
+                refreshInteractiveCandidates()
+            } else {
+                if (rawInput.isNotEmpty()) {
+                    val top = currentCommits.getOrNull(if (!previewChinese && currentCommits.size > 1) 1 else 0) ?: rawInput.toString()
+                    rawInput.clear()
+                    appendFormattedCommit(top)
+                }
+                appendFormattedCommit(text)
+                refreshInteractiveCandidates(showPostPredict = false)
+            }
+        }
+
         override fun onFunction(key: Key) {
             when (key.type) {
                 KeyType.SHIFT -> {
@@ -497,8 +757,39 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
                     keyboardView.shift = previewShift
                 }
                 KeyType.LANG -> {
+                    rawInput.clear()
                     previewChinese = !previewChinese
                     syncKeyboardFace()
+                    if (userInteractive) refreshInteractiveCandidates() else applyCoherentShowcase(null)
+                }
+                KeyType.SPACE -> {
+                    enterInteractiveIfNeeded(clearShowcase = false)
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (rawInput.isNotEmpty()) {
+                        val pickIdx = if (!previewChinese && currentPrefs.autoCorrect && currentCommits.size > 1 && currentCandidates[0].startsWith("“")) 1 else 0
+                        val chosen = currentCommits.getOrNull(pickIdx) ?: rawInput.toString()
+                        rawInput.clear()
+                        appendFormattedCommit(chosen)
+                        if (!previewChinese) simCommitted += " "
+                        refreshInteractiveCandidates(showPostPredict = true)
+                    } else if (currentPrefs.doubleSpacePeriod && now - lastSpaceMs < 450 && simCommitted.endsWith(" ") && simCommitted.length >= 2) {
+                        simCommitted = simCommitted.dropLast(1) + if (previewChinese) "。" else ". "
+                        lastSpaceMs = 0L
+                        refreshInteractiveCandidates(showPostPredict = false)
+                        return
+                    } else {
+                        simCommitted += " "
+                        refreshInteractiveCandidates(showPostPredict = false)
+                    }
+                    lastSpaceMs = now
+                }
+                KeyType.ENTER -> {
+                    enterInteractiveIfNeeded(clearShowcase = false)
+                    if (rawInput.isNotEmpty()) {
+                        appendFormattedCommit(rawInput.toString())
+                        rawInput.clear()
+                    }
+                    refreshInteractiveCandidates(showPostPredict = false)
                 }
                 KeyType.TO_SYMBOLS -> {
                     previewPage = Page.SYMBOLS
@@ -515,21 +806,68 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
                 else -> Unit
             }
         }
-        override fun onDeleteDown(repeat: Boolean) = Unit
+
+        override fun onDeleteDown(repeat: Boolean) {
+            enterInteractiveIfNeeded(clearShowcase = false)
+            if (rawInput.isNotEmpty()) {
+                rawInput.deleteCharAt(rawInput.length - 1)
+                refreshInteractiveCandidates()
+            } else if (simCommitted.isNotEmpty()) {
+                val cpLen = Character.charCount(Character.codePointBefore(simCommitted, simCommitted.length))
+                simCommitted = simCommitted.dropLast(cpLen)
+                refreshInteractiveCandidates()
+            }
+        }
+
         override fun onCursorMove(steps: Int) = Unit
         override fun onLongPressFunction(key: Key) = Unit
         override fun onKeyDownFeedback(key: Key) = playFeedback(key)
     }
 
     private val hwListener = object : HandwritingView.Listener {
-        override fun onHandwritingStrokes(strokes: List<List<HandwritingEngine.Point>>) = Unit
-        override fun onHandwritingAutoCommitPrevious() = Unit
-        override fun onHandwritingClear() = Unit
-        override fun onHandwritingPunct(punct: String) = Unit
+        override fun onHandwritingStrokes(strokes: List<List<HandwritingEngine.Point>>) {
+            userInteractive = true
+            bgWorker.execute {
+                val cands = HandwritingEngine.getOrLoad(context.applicationContext)
+                    ?.recognize(strokes, topK = 10, preferChinese = true)
+                    .orEmpty()
+                post {
+                    if (cands.isNotEmpty()) {
+                        currentCandidates = cands
+                        currentCommits = cands
+                        candidateBar.expandable = cands.size > 3
+                        candidateBar.setItems(cands, 0)
+                        onSimState(simCommitted, cands.first(), true)
+                    }
+                }
+            }
+        }
+
+        override fun onHandwritingAutoCommitPrevious() {
+            val top = currentCommits.firstOrNull() ?: return
+            appendFormattedCommit(top)
+            currentCandidates = emptyList(); currentCommits = emptyList()
+            onSimState(simCommitted, "", true)
+        }
+
+        override fun onHandwritingClear() {
+            if (userInteractive) {
+                currentCandidates = emptyList(); currentCommits = emptyList()
+                candidateBar.setItems(emptyList(), -1)
+                onSimState(simCommitted, "", true)
+            }
+        }
+
+        override fun onHandwritingPunct(punct: String) {
+            enterInteractiveIfNeeded(clearShowcase = true)
+            appendFormattedCommit(punct)
+            onSimState(simCommitted, "", true)
+        }
+
         override fun onHandwritingExitToKeyboard() = Unit
         override fun onHandwritingCycleHeight() = Unit
-        override fun onFunction(key: Key) = Unit
-        override fun onDeleteDown(repeat: Boolean) = Unit
+        override fun onFunction(key: Key) = kbListener.onFunction(key)
+        override fun onDeleteDown(repeat: Boolean) = kbListener.onDeleteDown(repeat)
         override fun onKeyDownFeedback(key: Key) = playFeedback(key)
     }
 
@@ -538,19 +876,20 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         override fun onT9Separator() = Unit
         override fun onT9Side(index: Int) = Unit
         override fun onT9Clear() = Unit
-        override fun onFunction(key: Key) = Unit
-        override fun onDeleteDown(repeat: Boolean) = Unit
+        override fun onFunction(key: Key) = kbListener.onFunction(key)
+        override fun onDeleteDown(repeat: Boolean) = kbListener.onDeleteDown(repeat)
         override fun onKeyDownFeedback(key: Key) = playFeedback(key)
     }
 
     init {
+        candidateBar.showImageIcon = false
         keyboardView = KeyboardView(context, kbListener).also { it.previewOverlay = previewOverlay }
         handwritingView = HandwritingView(context, hwListener).apply {
             previewDemoMode = true
             visibility = View.GONE
         }
         t9View = T9View(context, t9Listener).apply {
-            sideItems = listOf("shi", "zhi", "，", "。", "？", "！")
+            sideItems = listOf("shi", "zhi", "si", "zi", "，", "。")
             spaceLabel = "选定"
             visibility = View.GONE
         }
@@ -568,6 +907,11 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         }
         addView(column, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         addView(previewOverlay, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        bgWorker.shutdownNow()
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -620,11 +964,101 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         t9View.enterAccent = enterLbl.second
     }
 
-    fun bind(prefs: KeyboardPrefs, mode: PreviewMode, lastChangedKey: String?) {
+    /**
+     * Populates a 100% coherent input <-> preedit <-> candidate showcase tailored to the active mode & setting.
+     */
+    private fun applyCoherentShowcase(changedKey: String?) {
+        val prefs = currentPrefs
+        val mode = currentMode
+        when {
+            changedKey == KeyboardPrefs.KEY_OTP_AUTOFILL && prefs.otpAutoFill && mode != PreviewMode.HANDWRITING -> {
+                simCommitted = "短信验证码："
+                preeditBar.text = ""
+                candidateBar.expandable = false
+                candidateBar.freshOtpCode = "2046"
+                candidateBar.freshOtpSource = "信息"
+                currentCandidates = emptyList(); currentCommits = listOf("2046")
+                candidateBar.setItems(emptyList(), -1)
+                onSimState(simCommitted, "", false)
+            }
+            changedKey == KeyboardPrefs.KEY_CLIPBOARD_ENABLED && mode != PreviewMode.HANDWRITING -> {
+                simCommitted = if (prefs.clipboardEnabled) "顶栏剪贴板入口已开启" else "顶栏剪贴板入口已隐藏"
+                preeditBar.text = ""
+                candidateBar.expandable = false
+                candidateBar.freshOtpCode = null
+                currentCandidates = emptyList(); currentCommits = emptyList()
+                candidateBar.setItems(emptyList(), -1)
+                onSimState(simCommitted, "", false)
+            }
+            changedKey == KeyboardPrefs.KEY_POST_PREDICT && mode != PreviewMode.HANDWRITING -> {
+                simCommitted = "生日快乐"
+                preeditBar.text = ""
+                candidateBar.freshOtpCode = null
+                candidateBar.expandable = false
+                if (prefs.postCommitPredict) {
+                    val assoc = listOf("🎂", "天天开心", "🎉", "万事如意", "身体健康")
+                    currentCandidates = assoc; currentCommits = assoc
+                    candidateBar.setItems(assoc, -1)
+                } else {
+                    currentCandidates = emptyList(); currentCommits = emptyList()
+                    candidateBar.setItems(emptyList(), -1)
+                }
+                onSimState(simCommitted, "", false)
+            }
+            mode == PreviewMode.HANDWRITING -> {
+                simCommitted = ""
+                preeditBar.text = ""
+                candidateBar.freshOtpCode = null
+                candidateBar.expandable = true
+                val hwSample = listOf("永", "水", "咏", "泳", "求")
+                currentCandidates = hwSample; currentCommits = hwSample
+                candidateBar.setItems(hwSample, 0)
+                onSimState("", "永", false)
+            }
+            !previewChinese -> {
+                simCommitted = "Good "
+                preeditBar.text = ""
+                candidateBar.freshOtpCode = null
+                candidateBar.expandable = false
+                val enSample = listOf("morn", "morning", "mornings", "more")
+                currentCandidates = enSample; currentCommits = enSample
+                candidateBar.setItems(enSample, 1)
+                onSimState("Good ", "morn", false)
+            }
+            else -> {
+                // Coherent AI contextual disambiguation showcase: "秋水" + "shi zhi" -> "✦ 时至"
+                simCommitted = "秋水"
+                preeditBar.text = "shi zhi"
+                candidateBar.freshOtpCode = null
+                candidateBar.expandable = true
+                val labels = listOf("✦ 时至", "是指", "实质", "市值", "食指")
+                val commits = listOf("时至", "是指", "实质", "市值", "食指")
+                currentCandidates = labels; currentCommits = commits
+                candidateBar.setItems(labels, 0)
+                onSimState("秋水", "shi zhi", false)
+            }
+        }
+    }
+
+    fun bind(prefs: KeyboardPrefs, mode: PreviewMode, lastChangedKey: String?, resetSeq: Int) {
         val prev = currentPrefs
         val modeChanged = currentMode != mode
+        val resetTriggered = resetSeq != lastResetSeq
+        val keyTriggeredShowcase = lastChangedKey != lastHandledKey && lastChangedKey in setOf(
+            KeyboardPrefs.KEY_OTP_AUTOFILL,
+            KeyboardPrefs.KEY_CLIPBOARD_ENABLED,
+            KeyboardPrefs.KEY_POST_PREDICT,
+        )
         currentPrefs = prefs
         currentMode = mode
+        lastResetSeq = resetSeq
+        lastHandledKey = lastChangedKey
+
+        if (resetTriggered || modeChanged || keyTriggeredShowcase) {
+            userInteractive = false
+            rawInput.clear()
+            handwritingView.clearCanvas(notify = false)
+        }
 
         val t = KbTheme.resolve(context, prefs)
         setBackgroundColor(t.background)
@@ -647,39 +1081,10 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         handwritingView.visibility = if (mode == PreviewMode.HANDWRITING) View.VISIBLE else View.GONE
         t9View.visibility = if (mode == PreviewMode.T9) View.VISIBLE else View.GONE
 
-        val showOtpSample = lastChangedKey == KeyboardPrefs.KEY_OTP_AUTOFILL && prefs.otpAutoFill && mode != PreviewMode.HANDWRITING
-        val showToolbarSample = lastChangedKey == KeyboardPrefs.KEY_CLIPBOARD_ENABLED && mode != PreviewMode.HANDWRITING
-        when {
-            showOtpSample -> {
-                preeditBar.text = ""
-                candidateBar.expandable = false
-                candidateBar.freshOtpCode = "2046"
-                candidateBar.freshOtpSource = "信息"
-                candidateBar.setItems(emptyList(), -1)
-            }
-            showToolbarSample -> {
-                preeditBar.text = ""
-                candidateBar.expandable = false
-                candidateBar.freshOtpCode = null
-                candidateBar.setItems(emptyList(), -1)
-            }
-            mode == PreviewMode.HANDWRITING -> {
-                preeditBar.text = ""
-                candidateBar.freshOtpCode = null
-                candidateBar.expandable = true
-                candidateBar.setItems(listOf("永", "水", "咏", "泳", "求"), 0)
-            }
-            else -> {
-                preeditBar.text = "qiu shui shi zhi"
-                candidateBar.freshOtpCode = null
-                candidateBar.expandable = true
-                val sampleCands = if (prefs.postCommitPredict) {
-                    listOf("✦ 时至", "是指", "🎂", "天天开心", "实质")
-                } else {
-                    listOf("✦ 时至", "是指", "实质", "市值", "食指")
-                }
-                candidateBar.setItems(sampleCands, 0)
-            }
+        if (userInteractive) {
+            refreshInteractiveCandidates()
+        } else {
+            applyCoherentShowcase(lastChangedKey)
         }
 
         val hostW = width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels

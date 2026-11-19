@@ -43,6 +43,8 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
         set(v) { field = v; invalidate() }
     var clipboardEnabled: Boolean = true
         set(v) { field = v; invalidate() }
+    var imagesSupported: Boolean = true
+        set(v) { field = v; invalidate() }
 
     private val modes = InputMode.entries
     private val tiles = Tile.entries
@@ -139,7 +141,12 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             val cx = rc.centerX()
             val iconY = rc.top + rc.height() * 0.37f
             val labelY = rc.top + rc.height() * 0.78f
-            val iconColor = if (tile == Tile.TRADITIONAL && traditional) theme.accent else theme.text
+            val mutedTile = (tile == Tile.CLIPBOARD && !clipboardEnabled) || (tile == Tile.IMAGES && !imagesSupported)
+            val iconColor = when {
+                tile == Tile.TRADITIONAL && traditional -> theme.accent
+                mutedTile -> theme.textSecondary
+                else -> theme.text
+            }
 
             when (tile) {
                 Tile.CLIPBOARD -> KeyDraw.drawClipboardIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
@@ -166,7 +173,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
                     clipCount > 0 -> "剪贴板($clipCount)"
                     else -> "剪贴板"
                 }
-                Tile.IMAGES -> "图片/截图"
+                Tile.IMAGES -> if (imagesSupported) "图片/截图" else "图片(不支持)"
                 Tile.VOICE -> "离线语音"
                 Tile.RESIZE -> "键盘大小"
                 Tile.TRADITIONAL -> if (traditional) "繁体已开" else "简繁切换"
@@ -177,7 +184,11 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             val labelRc = RectF(rc.left + 3 * dp, labelY - 9 * dp, rc.right - 3 * dp, labelY + 9 * dp)
             KeyDraw.drawKeyText(
                 c, title, labelRc, 11.8f * u,
-                if (tile == Tile.TRADITIONAL && traditional) theme.accent else theme.text,
+                when {
+                    tile == Tile.TRADITIONAL && traditional -> theme.accent
+                    mutedTile -> theme.textSecondary
+                    else -> theme.text
+                },
                 text, dp, padH = 2 * dp, bold = tile == Tile.TRADITIONAL && traditional,
             )
         }

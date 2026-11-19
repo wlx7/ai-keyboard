@@ -6,18 +6,18 @@ Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET`，从
 
 ---
 
-## 下载安装（Release v2.2.0）
+## 下载安装（Release v2.3.0）
 
 前往 [**Releases 页面**](https://github.com/wlx7/ai-keyboard/releases/latest) 按需选择下载：
 
-1. **🌟 `keylo-2.2.0-arm64.apk`（内置 AI 完整旗舰版，主力推荐）**
+1. **🌟 `keylo-2.3.0-arm64.apk`（内置 AI 完整旗舰版，主力推荐）**
    - 直接将专属蒸馏模型 **`Keylo-285M Q4_0`（`154.5 MiB`）**、**233 万条中文大词库**、**23.3 万英文词库**、**4 万字全生僻字手写引擎** 与 **`sherpa-onnx` 流式离线语音模型** 全部内嵌于安装包中，**安装即享完整 AI 选句，无需手动下载或导入模型文件**（包名兼容旧版，可直接覆盖升级）。
-2. **⚡ `keylo-2.2.0-lite-arm64.apk`（精简外挂版，约 `86.8 MiB`）**
+2. **⚡ `keylo-2.3.0-lite-arm64.apk`（精简外挂版，约 `86.8 MiB`）**
    - 包含除内置 `.gguf` 外的全部词库、离线语音与全生僻字手写功能；可按需下载 `.gguf` 模型在设置中导入。
 
 ---
 
-## v2.2 核心特性一览
+## v2.3 核心特性一览
 
 - **Gboard 兼容个人词典与词库导入导出**
   - 原生兼容 **`# Gboard Dictionary version:1` 标准 `.zip`（内含 `dictionary.txt`）双向导入导出**，同时支持导入 Rime `.dict.yaml` / `.userdb.txt` 与纯文本词表，内置自定义快捷短语添加面板（如 `dz → 收货地址`、`omw → On my way!`）。

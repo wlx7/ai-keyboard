@@ -246,7 +246,8 @@ class ImeService : InputMethodService(),
         OtpStore.addListener(otpListener)
         RimeEngine.addStateListener(rimeListener)
         RimeEngine.traditional = prefs.getBoolean(KEY_TRADITIONAL, false)
-        AiRanker.alpha = prefs.getFloat(KEY_AI_ALPHA, AiRanker.DEFAULT_ALPHA)
+        val savedAlpha = prefs.getFloat(KEY_AI_ALPHA, AiRanker.DEFAULT_ALPHA)
+        AiRanker.alpha = if (savedAlpha in 1.2f..3.6f) savedAlpha else AiRanker.DEFAULT_ALPHA
         RimeEngine.start(this, prefs.getString(KEY_SCHEMA, null))
     }
 
@@ -595,7 +596,9 @@ class ImeService : InputMethodService(),
         candidates.freshOtpCode = otp?.code
         candidates.freshOtpSource = otp?.source
 
-        val freshImg = if (kbPrefs.screenshotBubble && scene.kind != FieldKind.PASSWORD) recentImageStore.activeFresh() else null
+        val acceptsImages = scene.kind != FieldKind.PASSWORD && RecentImageStore.editorAcceptsImages(currentInputEditorInfo)
+        candidates.showImageIcon = acceptsImages
+        val freshImg = if (kbPrefs.screenshotBubble && acceptsImages) recentImageStore.activeFresh() else null
         candidates.freshImageLabel = freshImg?.first?.let { if (it.isScreenshot) "发送刚截的图" else "发送最新照片" }
         candidates.freshImageThumb = freshImg?.second
 
@@ -612,6 +615,7 @@ class ImeService : InputMethodService(),
             toolPanel.shapeLabel = if (shapeSchema == "cangjie5") "仓颉" else "五笔"
             toolPanel.traditional = RimeEngine.traditional
             toolPanel.clipboardEnabled = kbPrefs.clipboardEnabled
+            toolPanel.imagesSupported = acceptsImages
             toolPanel.clipCount = if (kbPrefs.clipboardEnabled) clipboardStore.count() else 0
         }
         syncTopBarVisibility()
@@ -803,7 +807,13 @@ class ImeService : InputMethodService(),
                     setOverlay(Overlay.CLIPBOARD)
                 }
             }
-            ToolPanel.Tile.IMAGES -> setOverlay(Overlay.IMAGES)
+            ToolPanel.Tile.IMAGES -> {
+                if (!RecentImageStore.editorAcceptsImages(currentInputEditorInfo)) {
+                    Toast.makeText(this, "当前网页或输入框不支持直接发送图片", Toast.LENGTH_SHORT).show()
+                } else {
+                    setOverlay(Overlay.IMAGES)
+                }
+            }
             ToolPanel.Tile.VOICE -> setOverlay(Overlay.VOICE)
             ToolPanel.Tile.RESIZE -> setOverlay(Overlay.RESIZE)
             ToolPanel.Tile.TRADITIONAL -> {

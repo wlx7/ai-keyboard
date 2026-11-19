@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,9 +23,11 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.inputmethod.EditorInfoCompat
 import androidx.core.view.inputmethod.InputConnectionCompat
 import androidx.core.view.inputmethod.InputContentInfoCompat
+import java.io.File
 import java.util.concurrent.Executors
 
 /**
@@ -296,43 +299,69 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
     }.getOrDefault(emptyList())
 
     /**
+     * Stages [item] into our own `FileProvider` cache (`content://app.aikb.ime.fileprovider/...`)
+     * so `INPUT_CONTENT_GRANT_READ_URI_PERMISSION` genuinely delegates read access to browsers
+     * (Chrome / WebView) and chat apps that do NOT hold `READ_MEDIA_IMAGES` themselves.
+     */
+    private fun stageForFileProvider(item: ImageItem, supportedMimes: Array<String>): Pair<Uri, String>? = runCatching {
+        val dir = File(context.cacheDir, "shared_images").apply { mkdirs() }
+        dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(5)?.forEach { it.delete() }
+
+        val webFriendly = item.mimeType.lowercase() in setOf("image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp")
+        val directMatch = webFriendly && supportedMimes.any { pattern ->
+            ClipDescription.compareMimeTypes(item.mimeType, pattern) || pattern == "*/*" || pattern == "image/*"
+        }
+
+        val dstFile: File
+        val outMime: String
+        if (directMatch) {
+            val ext = when (item.mimeType.lowercase()) {
+                "image/png" -> "png"
+                "image/gif" -> "gif"
+                "image/webp" -> "webp"
+                else -> "jpg"
+            }
+            outMime = if (item.mimeType.lowercase() == "image/jpg") "image/jpeg" else item.mimeType
+            dstFile = File(dir, "share_${item.id}.$ext")
+            if (!dstFile.exists() || dstFile.length() == 0L) {
+                context.contentResolver.openInputStream(item.uri)?.use { input ->
+                    dstFile.outputStream().use { out -> input.copyTo(out, 64 * 1024) }
+                } ?: return null
+            }
+        } else {
+            // Transcode HEIC / exotic formats to universal JPEG so Chrome & web editors accept it cleanly
+            outMime = "image/jpeg"
+            dstFile = File(dir, "share_${item.id}.jpg")
+            if (!dstFile.exists() || dstFile.length() == 0L) {
+                val bmp = context.contentResolver.openInputStream(item.uri)?.use { BitmapFactory.decodeStream(it) } ?: return null
+                dstFile.outputStream().use { out -> bmp.compress(Bitmap.CompressFormat.JPEG, 92, out) }
+            }
+        }
+        val fpUri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", dstFile)
+        fpUri to outMime
+    }.getOrNull()
+
+    /**
      * Sends [item] directly into the current editor via `InputConnectionCompat.commitContent`
-     * and immediately marks [item] as consumed so the top-bar bubble never lingers after sending.
+     * backed by our `FileProvider` URI, and immediately marks [item] as consumed.
      */
     fun sendImage(ic: InputConnection?, editorInfo: EditorInfo?, item: ImageItem): Boolean {
-        // Always consume immediately on user tap so the bubble disappears right away and never re-appears.
         latestFresh?.let { if (it.id != item.id) markConsumed(it, isSend = true) }
         markConsumed(item, isSend = true)
 
-        if (ic == null || editorInfo == null) return false
+        if (ic == null || editorInfo == null || !editorAcceptsImages(editorInfo)) return false
         val supportedMimes = EditorInfoCompat.getContentMimeTypes(editorInfo)
-        val mimeSupported = supportedMimes.any { pattern ->
-            ClipDescription.compareMimeTypes(item.mimeType, pattern) || ClipDescription.compareMimeTypes("image/*", pattern)
-        }
-        val desc = ClipDescription(item.displayName, arrayOf(item.mimeType))
-        val contentInfo = InputContentInfoCompat(item.uri, desc, null)
+        val staged = stageForFileProvider(item, supportedMimes)
+        val targetUri = staged?.first ?: item.uri
+        val targetMime = staged?.second ?: item.mimeType
+
+        val desc = ClipDescription(item.displayName, arrayOf(targetMime))
+        val contentInfo = InputContentInfoCompat(targetUri, desc, null)
         val flags = InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION
 
-        if (mimeSupported || supportedMimes.isNotEmpty()) {
-            val ok = runCatching {
-                contentInfo.requestPermission()
-                InputConnectionCompat.commitContent(ic, editorInfo, contentInfo, flags, null)
-            }.getOrDefault(false)
-            if (ok) return true
-        }
-
-        val fallbackDirect = runCatching {
+        return runCatching {
             InputConnectionCompat.commitContent(ic, editorInfo, contentInfo, flags, null)
         }.getOrDefault(false)
-        if (fallbackDirect) return true
-
-        runCatching {
-            internalUriCopyAt = System.currentTimeMillis()
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            cm?.setPrimaryClip(ClipData.newUri(context.contentResolver, item.displayName, item.uri))
-            Toast.makeText(context, "当前输入框不支持直传，已复制图片可长按粘贴", Toast.LENGTH_SHORT).show()
-        }
-        return false
     }
 
     companion object {
@@ -340,6 +369,24 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
         private const val POST_SEND_COOLDOWN_MS = 15_000L
         private const val PREF_CONSUMED_IDS = "consumed_image_ids"
         private const val PREF_CONSUMED_NAMES = "consumed_image_names"
+
+        /**
+         * Returns true ONLY when the target [editorInfo] explicitly advertises rich image support
+         * via `EditorInfoCompat.getContentMimeTypes`. Plain `<textarea>`, URL bars, and text-only
+         * fields return false so we never display an unusable image bubble.
+         */
+        fun editorAcceptsImages(editorInfo: EditorInfo?): Boolean {
+            if (editorInfo == null) return false
+            val mimes = EditorInfoCompat.getContentMimeTypes(editorInfo)
+            if (mimes.isEmpty()) return false
+            return mimes.any { pattern ->
+                pattern == "*/*" ||
+                    pattern.startsWith("image/") ||
+                    ClipDescription.compareMimeTypes("image/png", pattern) ||
+                    ClipDescription.compareMimeTypes("image/jpeg", pattern) ||
+                    ClipDescription.compareMimeTypes("image/webp", pattern)
+            }
+        }
 
         fun hasImagePermission(context: Context): Boolean {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

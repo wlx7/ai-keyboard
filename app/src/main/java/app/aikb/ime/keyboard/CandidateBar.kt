@@ -62,6 +62,9 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     var showClipboardIcon = true
         set(v) { if (field != v) { field = v; invalidate() } }
 
+    var showImageIcon = true
+        set(v) { if (field != v) { field = v; invalidate() } }
+
     var freshClip: String? = null
         set(v) { if (field != v) { field = v; invalidate() } }
 
@@ -157,12 +160,17 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     private fun updateToolbarRects(w: Float, h: Float) {
         menuRect.set(4 * dp, 4 * dp, 44 * dp, h - 4 * dp)
         hwRect.set(48 * dp, 5.5f * dp, 112 * dp, h - 5.5f * dp)
+        var nextX = 116 * dp
         if (showClipboardIcon) {
-            clipRect.set(116 * dp, 4 * dp, 156 * dp, h - 4 * dp)
-            imgRect.set(158 * dp, 4 * dp, 198 * dp, h - 4 * dp)
+            clipRect.set(nextX, 4 * dp, nextX + 40 * dp, h - 4 * dp)
+            nextX += 42 * dp
         } else {
             clipRect.setEmpty()
-            imgRect.set(116 * dp, 4 * dp, 156 * dp, h - 4 * dp)
+        }
+        if (showImageIcon) {
+            imgRect.set(nextX, 4 * dp, nextX + 40 * dp, h - 4 * dp)
+        } else {
+            imgRect.setEmpty()
         }
         hideRect.set(w - 44 * dp, 4 * dp, w - 4 * dp, h - 4 * dp)
         voiceRect.set(w - 86 * dp, 4 * dp, w - 46 * dp, h - 4 * dp)
@@ -390,8 +398,8 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
                 }
             }
 
-            // `[🖼]` Recent Photos & Screenshots icon (if room permits)
-            if (imgRect.right <= voiceRect.left - 2 * dp) {
+            // `[🖼]` Recent Photos & Screenshots icon (shown only when editor accepts images)
+            if (showImageIcon && !imgRect.isEmpty && imgRect.right <= voiceRect.left - 2 * dp) {
                 if (pressedToolbar == ToolbarAction.IMAGES) {
                     fill.color = theme.keyPressed
                     c.drawRoundRect(imgRect, 9 * dp, 9 * dp, fill)
