@@ -47,6 +47,7 @@ import app.aikb.ime.engine.Rime
 import app.aikb.ime.engine.RimeEngine
 import app.aikb.ime.engine.T9
 import app.aikb.ime.engine.UserHistory
+import app.aikb.ime.engine.UserZhLexicon
 import app.aikb.ime.keyboard.CandidateBar
 import app.aikb.ime.keyboard.CandidatePanel
 import app.aikb.ime.keyboard.ClipboardPanel
@@ -132,8 +133,22 @@ class ImeService : InputMethodService(),
     private var showZhPredictions = false
     private var shownCandidates: List<String> = emptyList()
     private var candidateCommits: List<String> = emptyList()
-    /** Candidates injected by AI / PinyinCorrector that commit directly and clear Rime composition. */
+    private var panelCommits: List<String> = emptyList()
+    /** Candidates injected by AI / UserZhLexicon / PinyinCorrector that commit directly and clear Rime composition. */
     private val directZhCommits = HashSet<String>()
+    /** Maps a learned partial-prefix candidate (`"禁色"`) to its remaining raw Pinyin tail (`"zheshouge"`). */
+    private val partialZhPrefixTail = HashMap<String, String>()
+    /** Tracks segment-by-segment picks inside a multi-syllable composition (`"jinse"` -> `[("jin","禁"),("se","色")]`). */
+    private val zhChainSegments = ArrayList<Pair<String, String>>()
+    private var zhChainSchema = ""
+    private var pendingRimePickRank = 0
+
+    private fun resetZhLearningChain() {
+        zhChainSegments.clear()
+        zhChainSchema = ""
+        pendingRimePickRank = 0
+        UserZhLexicon.resetConsecutiveTracker()
+    }
 
     private var lastAutoCorrect: Pair<String, String>? = null
     private var rejected: String? = null
@@ -200,6 +215,9 @@ class ImeService : InputMethodService(),
             key == "clear_history_at" -> {
                 history.clear()
                 zhPredictor?.clearUserHistory()
+                UserZhLexicon.clearAll(this)
+                AiRanker.clearMemory()
+                resetZhLearningChain()
                 showNextPredictions = false
                 showZhPredictions = false
                 updateCandidates()
@@ -209,6 +227,7 @@ class ImeService : InputMethodService(),
                 english = runCatching { EnglishEngine(EnglishDictionary.load(this), history) }.getOrNull()
                 zhPredictor = runCatching { ChinesePredictor.load(this, filesDir.resolve("zh_user.tsv")) }.getOrNull()
                 PersonalDictionary.loadFromFile(filesDir.resolve("personal_dict.tsv"), force = true)
+                UserZhLexicon.loadFromFile(filesDir.resolve("zh_learned_words.tsv"), force = true)
                 updateCandidates()
             }
             key in KeyboardPrefs.APPEARANCE_KEYS -> {
@@ -230,6 +249,7 @@ class ImeService : InputMethodService(),
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         history = UserHistory(filesDir.resolve("en_user.tsv"))
         PersonalDictionary.ensureLoaded(this)
+        UserZhLexicon.ensureLoaded(this)
         clipboardStore = ClipboardStore(filesDir.resolve("clipboard_pinned.txt"))
         recentImageStore = RecentImageStore(this) { syncToolbarState() }.also { it.startObserving() }
         sysClipboard = (getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager)?.also {
@@ -271,12 +291,16 @@ class ImeService : InputMethodService(),
         candidates = CandidateBar(this) { pickCandidate(it) }.also { bar ->
             bar.onExpandToggle = { setOverlay(if (overlay == Overlay.CANDIDATES) Overlay.NONE else Overlay.CANDIDATES) }
             bar.onToolbarAction = { onToolbarAction(it) }
+            bar.onLongPressPick = { onLongPressCandidate(it, fromPanel = false) }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             inlineAutofillBar = InlineAutofillBar(this).apply { visibility = View.GONE }
         }
         emoji = EmojiPanel(this, this).apply { visibility = View.GONE }
-        candidatePanel = CandidatePanel(this) { pickFromPanel(it) }.apply { visibility = View.GONE }
+        candidatePanel = CandidatePanel(this) { pickFromPanel(it) }.apply {
+            visibility = View.GONE
+            onLongPressPick = { onLongPressCandidate(it, fromPanel = true) }
+        }
         toolPanel = ToolPanel(this, this).apply { visibility = View.GONE }
         clipboardPanel = ClipboardPanel(this, clipboardStore, this).apply { visibility = View.GONE }
         voicePanel = VoicePanel(this, this).apply { visibility = View.GONE }
@@ -420,6 +444,7 @@ class ImeService : InputMethodService(),
             currentInputConnection?.finishComposingText()
             editorCandStart = -1; editorCandEnd = -1
             aiSuggestion = null; aiRunnerUp = null
+            resetZhLearningChain()
         }
         if (handwritingMode) hwWorker.execute { HandwritingEngine.getOrLoad(applicationContext) }
         if (aiEnabled()) aiWorker.execute { AiRanker.ensureLoaded(applicationContext) }
@@ -451,8 +476,10 @@ class ImeService : InputMethodService(),
         setOverlay(Overlay.NONE)
         history.save()
         zhPredictor?.save()
+        UserZhLexicon.save()
         prefs.edit().putFloat(KEY_AI_ALPHA, AiRanker.alpha).apply()
         aiSuggestion = null; aiRunnerUp = null
+        resetZhLearningChain()
     }
 
     override fun onUpdateSelection(oldSelStart: Int, oldSelEnd: Int, newSelStart: Int, newSelEnd: Int, candidatesStart: Int, candidatesEnd: Int) {
@@ -467,6 +494,7 @@ class ImeService : InputMethodService(),
             (candidatesEnd >= 0 && (newSelStart != candidatesEnd || newSelEnd != candidatesEnd)) ||
             (candidatesEnd < 0 && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 1)
         )
+        if (userJumpedCursor) resetZhLearningChain()
         if (composing.isNotEmpty() && userJumpedCursor) {
             currentInputConnection?.finishComposingText()
             composing.clear(); result = null; showNextPredictions = false
@@ -479,6 +507,7 @@ class ImeService : InputMethodService(),
         }
         if (composing.isEmpty() && !zhComposing) {
             if (elapsed >= 300 && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 2) {
+                resetZhLearningChain()
                 showNextPredictions = false
                 showZhPredictions = false
                 updateCandidates()
@@ -641,8 +670,7 @@ class ImeService : InputMethodService(),
         when (resolved) {
             Overlay.CANDIDATES -> {
                 candidatePanel.layoutParams = candidatePanel.layoutParams.apply { height = h }
-                val list = if (hwComposing) hwCandidates else RimeEngine.snapshot(300).candidates.map { it.text }
-                candidatePanel.setItems(list)
+                refreshExpandedCandidatePanel()
             }
             Overlay.EMOJI -> {
                 emoji.layoutParams = emoji.layoutParams.apply { height = h }
@@ -720,6 +748,8 @@ class ImeService : InputMethodService(),
                 val clip = clipboardStore.freshClip() ?: return
                 clipboardStore.dismissFresh()
                 currentInputConnection?.commitText(clip, 1)
+                if (scene.learn && scene.kind != FieldKind.PASSWORD) AiRanker.remember(clip)
+                resetZhLearningChain()
                 syncToolbarState()
             }
             CandidateBar.ToolbarAction.DISMISS_FRESH -> {
@@ -904,6 +934,8 @@ class ImeService : InputMethodService(),
         triggerHaptic()
         clipboardStore.dismissFresh()
         currentInputConnection?.commitText(text, 1)
+        if (scene.learn && scene.kind != FieldKind.PASSWORD) AiRanker.remember(text)
+        resetZhLearningChain()
         setOverlay(Overlay.NONE)
         syncToolbarState()
     }
@@ -917,7 +949,9 @@ class ImeService : InputMethodService(),
         ic.finishComposingText()
         val prevZh = trailingZhWordBeforeCursor()
         commitFormatted(ic, text)
+        resetZhLearningChain()
         if (text.any(ChinesePredictor::isCjk)) {
+            if (scene.learn && scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text)
             recordChineseCommit(prevZh, text)
             updateCandidates()
         }
@@ -1039,6 +1073,7 @@ class ImeService : InputMethodService(),
                 commitComposing(useAutoCorrect = punct)
             }
             commitFormatted(ic, text)
+            resetZhLearningChain()
             showNextPredictions = false
             showZhPredictions = false
             if (shift == ShiftState.ONCE && page == Page.LETTERS) setShift(ShiftState.OFF)
@@ -1082,6 +1117,7 @@ class ImeService : InputMethodService(),
                 if (hwComposing) { hwCommitTop(); return }
                 if (zhComposing) { zhCommitRaw(); return }
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                resetZhLearningChain()
                 if (scene.action != EditorInfo.IME_ACTION_NONE) {
                     ic?.performEditorAction(scene.action)
                 } else if (kbPrefs.enterToSend && scene.kind == FieldKind.TEXT) {
@@ -1108,6 +1144,7 @@ class ImeService : InputMethodService(),
                 if (hwComposing) hwCommitTop()
                 if (zhComposing) zhCommitRaw()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                resetZhLearningChain()
                 showNextPredictions = false
                 showZhPredictions = false
                 chinese = !chinese
@@ -1156,13 +1193,17 @@ class ImeService : InputMethodService(),
         }
         if (zhComposing) {
             val firstCommit = candidateCommits.firstOrNull()
-            if (firstCommit != null && firstCommit in directZhCommits) {
+            val remTail = if (firstCommit != null) partialZhPrefixTail[firstCommit] else null
+            if (firstCommit != null && remTail != null) {
+                commitPartialZhPrefix(firstCommit, remTail)
+            } else if (firstCommit != null && firstCommit in directZhCommits) {
                 commitDirectZh(firstCommit, pickedAi = firstCommit == aiSuggestion)
             } else {
                 zhKey(Rime.XK_SPACE)
             }
             return
         }
+        resetZhLearningChain()
         showZhPredictions = false
         if (composing.isNotEmpty()) {
             if (chinese) {
@@ -1208,6 +1249,7 @@ class ImeService : InputMethodService(),
     override fun onSwipeDeleteWord() {
         triggerHaptic()
         lastEditAt = SystemClock.uptimeMillis()
+        resetZhLearningChain()
         val ic = currentInputConnection ?: return
         if (zhComposing) {
             RimeEngine.clear()
@@ -1246,6 +1288,7 @@ class ImeService : InputMethodService(),
         lastEditAt = SystemClock.uptimeMillis()
         val ic = currentInputConnection ?: return
         if (zhComposing) { zhKey(Rime.XK_BACKSPACE); return }
+        resetZhLearningChain()
         if (composing.isNotEmpty()) {
             composing.deleteCharAt(composing.length - 1)
             if (composing.isEmpty()) ic.commitText("", 1) else ic.setComposingText(composing, 1)
@@ -1329,6 +1372,7 @@ class ImeService : InputMethodService(),
         val labels = ArrayList<String>()
         val commits = ArrayList<String>()
         directZhCommits.clear()
+        partialZhPrefixTail.clear()
         var highlight = -1
         var keepToolbarEdges = false
         when {
@@ -1337,13 +1381,48 @@ class ImeService : InputMethodService(),
                 highlight = 0
             }
             zhComposing -> {
+                val schema = RimeEngine.currentSchema() ?: "rime_ice"
+                val shown = zhDisplay()
+                val rawBefore = currentInputConnection?.getTextBeforeCursor(80 + shown.length, 0)?.toString().orEmpty()
+                val contextBefore = rawBefore.dropLast(shown.length.coerceAtMost(rawBefore.length))
+                val learned = UserZhLexicon.lookup(schema, zh.input, contextBefore, AiRanker.sessionMemory())
+                fun maybeTrad(w: String): String =
+                    if (RimeEngine.traditional) HandwritingEngine.toTraditional(this, w) else w
+
                 val personalMatches = PersonalDictionary.match(zh.input, chinese = true, max = 2)
                 personalMatches.filter { it.exactShortcut }.forEach { m ->
-                    val outTxt = if (RimeEngine.traditional) HandwritingEngine.toTraditional(this, m.word) else m.word
+                    val outTxt = maybeTrad(m.word)
                     if (outTxt !in commits) {
                         labels += outTxt
                         commits += outTxt
                         directZhCommits += outTxt
+                    }
+                }
+                learned.topPriority.forEach { rawW ->
+                    val outTxt = maybeTrad(rawW)
+                    if (outTxt !in commits) {
+                        labels += if (rawW in learned.contextSparkleSet) "✦ $outTxt" else outTxt
+                        commits += outTxt
+                        directZhCommits += outTxt
+                    }
+                }
+                learned.prefixSplits.firstOrNull()?.let { (rawPrefix, remInput) ->
+                    val outPrefix = maybeTrad(rawPrefix)
+                    val tailComplete = schema != "rime_ice" || PinyinCorrector.allCompleteSyllables(remInput)
+                    if (tailComplete) {
+                        val tailTop = RimeEngine.queryTop(schema, remInput, 1).firstOrNull()
+                        if (!tailTop.isNullOrEmpty()) {
+                            val fullOut = outPrefix + tailTop
+                            if (fullOut !in commits) {
+                                labels += "✦ $fullOut"
+                                commits += fullOut
+                                directZhCommits += fullOut
+                            }
+                        }
+                    } else if (outPrefix !in commits) {
+                        labels += outPrefix
+                        commits += outPrefix
+                        partialZhPrefixTail[outPrefix] = remInput
                     }
                 }
                 aiSuggestion?.let {
@@ -1360,8 +1439,24 @@ class ImeService : InputMethodService(),
                         commits += c.text
                     }
                     if (idx == 0) {
+                        learned.secondary.forEach { rawW ->
+                            val outTxt = maybeTrad(rawW)
+                            if (outTxt !in commits) {
+                                labels += outTxt
+                                commits += outTxt
+                                directZhCommits += outTxt
+                            }
+                        }
+                        learned.prefixSplits.forEach { (rawPrefix, remInput) ->
+                            val outPrefix = maybeTrad(rawPrefix)
+                            if (outPrefix !in commits) {
+                                labels += outPrefix
+                                commits += outPrefix
+                                partialZhPrefixTail[outPrefix] = remInput
+                            }
+                        }
                         personalMatches.filter { !it.exactShortcut }.forEach { m ->
-                            val outTxt = if (RimeEngine.traditional) HandwritingEngine.toTraditional(this, m.word) else m.word
+                            val outTxt = maybeTrad(m.word)
                             if (outTxt !in commits) {
                                 labels += outTxt
                                 commits += outTxt
@@ -1376,9 +1471,8 @@ class ImeService : InputMethodService(),
                     }
                 }
                 // Non-intrusive Chinese QWERTY Typo Correction:
-                // Never injects guesses when Rime already matched a full-word phrase for valid Pinyin (e.g. `bu dong -> 不懂 | 不动`).
-                val schema = RimeEngine.currentSchema() ?: "rime_ice"
-                if (kbPrefs.smartPinyinCorrect && schema == "rime_ice") {
+                // Never injects guesses when Rime already matched a full-word phrase or UserZhLexicon matched a word.
+                if (kbPrefs.smartPinyinCorrect && schema == "rime_ice" && learned.topPriority.isEmpty()) {
                     val typoFixes = PinyinCorrector.resolveCandidates(schema, zh.input, rimeTexts.firstOrNull(), commits)
                     if (typoFixes.isNotEmpty()) {
                         val isBroken = PinyinCorrector.minCompleteSyllables(zh.input) < 0
@@ -1492,7 +1586,63 @@ class ImeService : InputMethodService(),
         syncToolbarState()
         candidates.expandable = (zhComposing || hwComposing) && labels.size > 3
         candidates.setItems(labels, highlight, keepToolbarEdges = keepToolbarEdges)
-        if (!zhComposing && !hwComposing && overlay == Overlay.CANDIDATES) setOverlay(Overlay.NONE)
+        if (!zhComposing && !hwComposing && overlay == Overlay.CANDIDATES) {
+            setOverlay(Overlay.NONE)
+        } else if (overlay == Overlay.CANDIDATES) {
+            refreshExpandedCandidatePanel()
+        }
+    }
+
+    private fun refreshExpandedCandidatePanel() {
+        if (!::candidatePanel.isInitialized || overlay != Overlay.CANDIDATES) return
+        if (hwComposing) {
+            panelCommits = hwCandidates
+            candidatePanel.setItems(hwCandidates)
+            return
+        }
+        if (!zhComposing) return
+        val pLabels = ArrayList<String>()
+        val pCommits = ArrayList<String>()
+        shownCandidates.forEachIndexed { idx, lbl ->
+            val cm = candidateCommits.getOrNull(idx) ?: return@forEachIndexed
+            if (cm.isNotEmpty() && cm !in pCommits) {
+                pLabels += lbl
+                pCommits += cm
+            }
+        }
+        for (c in RimeEngine.snapshot(300).candidates) {
+            if (c.text.isNotEmpty() && c.text !in pCommits) {
+                pLabels += c.text
+                pCommits += c.text
+            }
+        }
+        panelCommits = pCommits
+        candidatePanel.setItems(pLabels)
+    }
+
+    private fun onLongPressCandidate(index: Int, fromPanel: Boolean) {
+        val word = (if (fromPanel) panelCommits else candidateCommits)
+            .getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return
+        triggerHaptic()
+        var removed = UserZhLexicon.forget(word)
+        val pdMatches = PersonalDictionary.allEntries(this).filter { it.word.equals(word, ignoreCase = true) }
+        if (pdMatches.isNotEmpty()) {
+            pdMatches.forEach { PersonalDictionary.remove(this, it) }
+            removed = true
+        }
+        if (zhComposing) {
+            val rimeIdx = RimeEngine.snapshot(300).candidates.indexOfFirst { it.text == word }
+            if (rimeIdx >= 0 && RimeEngine.forget(rimeIdx)) {
+                zh = RimeEngine.snapshot()
+                removed = true
+            }
+        }
+        if (removed) {
+            if (aiSuggestion == word) aiSuggestion = null
+            if (aiRunnerUp == word) aiRunnerUp = null
+            Toast.makeText(this, "已从记忆词库移除「$word」", Toast.LENGTH_SHORT).show()
+            updateCandidates()
+        }
     }
 
     private fun emailSuggestions(labels: MutableList<String>, commits: MutableList<String>) {
@@ -1533,12 +1683,18 @@ class ImeService : InputMethodService(),
         }
         if (zhComposing) {
             val text = candidateCommits.getOrNull(index) ?: return
+            val remTail = partialZhPrefixTail[text]
+            if (remTail != null) {
+                commitPartialZhPrefix(text, remTail)
+                return
+            }
             if (text in directZhCommits) {
                 commitDirectZh(text, pickedAi = text == aiSuggestion || text == aiRunnerUp)
                 return
             }
             val rimeIndex = zh.candidates.indexOfFirst { it.text == text }.takeIf { it >= 0 } ?: index
             if (aiSuggestion != null) AiRanker.feedback(pickedAi = false, pickedRime = rimeIndex == 0)
+            pendingRimePickRank = rimeIndex
             RimeEngine.select(rimeIndex)
             zhSync()
             return
@@ -1602,12 +1758,54 @@ class ImeService : InputMethodService(),
         lastEditAt = SystemClock.uptimeMillis()
         val ic = currentInputConnection
         val oldShownLen = if (zhComposing) zhDisplay().length else 0
+        val inputBefore = zh.input
+        val pickRank = pendingRimePickRank
+        pendingRimePickRank = 0
         val commit = RimeEngine.takeCommit()
         zh = RimeEngine.snapshot()
         if (commit != null) {
             val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
             commitFormatted(ic, commit, skipBeforeLen = oldShownLen)
             recordChineseCommit(prevZh, commit)
+            if (scene.learn && scene.kind != FieldKind.PASSWORD) {
+                val schema = RimeEngine.currentSchema() ?: "rime_ice"
+                val remInput = if (zh.composing) zh.input else ""
+                val consumedInput = if (remInput.isNotEmpty() && inputBefore.endsWith(remInput)) {
+                    inputBefore.dropLast(remInput.length)
+                } else {
+                    inputBefore
+                }
+                if (consumedInput.isNotEmpty() && commit.all(ChinesePredictor::isCjk)) {
+                    if (zhChainSchema != schema) zhChainSegments.clear()
+                    zhChainSchema = schema
+                    zhChainSegments += consumedInput to commit
+                }
+                if (!zh.composing) {
+                    if (zhChainSegments.size >= 2) {
+                        UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments)
+                    } else if (zhChainSegments.size == 1) {
+                        val (cCode, cWord) = zhChainSegments[0]
+                        val cpLen = cWord.codePointCount(0, cWord.length)
+                        if (cpLen >= 2 && pickRank > 0) {
+                            UserZhLexicon.learnPhrase(schema, cCode, cWord, boost = 2)
+                        } else if (cpLen == 1) {
+                            val recentCtx = ic?.getTextBeforeCursor(40, 0)?.toString().orEmpty()
+                            UserZhLexicon.onSingleCharCommit(
+                                schema = schema,
+                                rawCode = cCode,
+                                charText = cWord,
+                                wasNonDefaultPick = pickRank >= 1,
+                                recentContext = recentCtx,
+                            )
+                        } else {
+                            UserZhLexicon.resetConsecutiveTracker()
+                        }
+                    }
+                    zhChainSegments.clear()
+                }
+            }
+        } else if (!zh.composing) {
+            zhChainSegments.clear()
         }
         if (zh.input != aiInput) {
             aiSuggestion = null
@@ -1660,7 +1858,10 @@ class ImeService : InputMethodService(),
             aiWorker.execute {
                 try {
                     if (gen != aiGeneration.get() || !AiRanker.ensureLoaded(applicationContext)) return@execute
-                    val s = AiRanker.suggest(context, schema, input, syllables) { gen != aiGeneration.get() } ?: return@execute
+                    val learnedExtras = UserZhLexicon.lookup(schema, input, context, AiRanker.sessionMemory()).topPriority
+                    val s = AiRanker.suggest(context, schema, input, syllables, extraCandidates = learnedExtras) {
+                        gen != aiGeneration.get()
+                    } ?: return@execute
                     val outTop = if (RimeEngine.traditional) HandwritingEngine.toTraditional(applicationContext, s.text) else s.text
                     val outSecond = s.runnerUp?.let { if (RimeEngine.traditional) HandwritingEngine.toTraditional(applicationContext, it) else it }
                     aiHandler.post {
@@ -1680,15 +1881,54 @@ class ImeService : InputMethodService(),
         aiHandler.postDelayed(job, 90L)
     }
 
+    private fun commitPartialZhPrefix(text: String, remTail: String) {
+        lastEditAt = SystemClock.uptimeMillis()
+        val ic = currentInputConnection
+        val oldShownLen = if (zhComposing) zhDisplay().length else 0
+        val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
+        val curSchema = RimeEngine.currentSchema() ?: "rime_ice"
+        val consumed = if (zh.input.length > remTail.length) zh.input.dropLast(remTail.length) else ""
+        if (scene.learn && scene.kind != FieldKind.PASSWORD && consumed.isNotEmpty() && text.all(ChinesePredictor::isCjk)) {
+            if (zhChainSchema != curSchema) zhChainSegments.clear()
+            zhChainSchema = curSchema
+            zhChainSegments += consumed to text
+        }
+        commitFormatted(ic, text, skipBeforeLen = oldShownLen)
+        recordChineseCommit(prevZh, text)
+        RimeEngine.replaceInput(remTail)
+        zh = RimeEngine.snapshot()
+        aiSuggestion = null
+        aiRunnerUp = null
+        if (zh.composing) {
+            showZhPredictions = false
+            ic?.setComposingText(zhDisplay(), 1)
+        }
+        setOverlay(Overlay.NONE)
+        updateCandidates()
+        updateT9Side()
+        scheduleAi()
+    }
+
     private fun commitDirectZh(text: String, pickedAi: Boolean) {
         lastEditAt = SystemClock.uptimeMillis()
         val oldShownLen = if (zhComposing) zhDisplay().length else 0
+        val inputBefore = zh.input
+        val schema = RimeEngine.currentSchema() ?: "rime_ice"
         val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
         RimeEngine.clear()
         zh = EMPTY_ZH
         aiSuggestion = null
         aiRunnerUp = null
         commitFormatted(currentInputConnection, text, skipBeforeLen = oldShownLen)
+        if (scene.learn && scene.kind != FieldKind.PASSWORD && inputBefore.isNotEmpty() && text.all(ChinesePredictor::isCjk)) {
+            if (zhChainSegments.isNotEmpty() && zhChainSchema == schema) {
+                zhChainSegments += inputBefore to text
+                UserZhLexicon.learnFromSegmentChain(schema, zhChainSegments)
+            } else {
+                UserZhLexicon.learnPhrase(schema, inputBefore, text, boost = 2)
+            }
+        }
+        zhChainSegments.clear()
         if (pickedAi) AiRanker.feedback(pickedAi = true, pickedRime = false)
         recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
@@ -1758,6 +1998,7 @@ class ImeService : InputMethodService(),
         hwCandidates = emptyList()
         handwriting.hasPendingComposition = false
         commitFormatted(currentInputConnection, top, skipBeforeLen = top.length)
+        if (scene.learn && scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(top)
         recordChineseCommit(prevZh, top)
         updateCandidates()
     }
@@ -1819,6 +2060,7 @@ class ImeService : InputMethodService(),
             handwriting.hasPendingComposition = false
         }
         commitFormatted(currentInputConnection, text, skipBeforeLen = oldTopLen)
+        if (scene.learn && scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text)
         recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
         updateCandidates()
@@ -1865,16 +2107,31 @@ class ImeService : InputMethodService(),
             return
         }
         if (!zhComposing) { setOverlay(Overlay.NONE); return }
-        RimeEngine.select(index)
+        val text = panelCommits.getOrNull(index) ?: run { setOverlay(Overlay.NONE); return }
+        val remTail = partialZhPrefixTail[text]
+        if (remTail != null) {
+            commitPartialZhPrefix(text, remTail)
+            return
+        }
+        if (text in directZhCommits) {
+            commitDirectZh(text, pickedAi = text == aiSuggestion || text == aiRunnerUp)
+            return
+        }
+        val rimeIndex = RimeEngine.snapshot(300).candidates.indexOfFirst { it.text == text }.takeIf { it >= 0 } ?: index
+        pendingRimePickRank = rimeIndex
+        RimeEngine.select(rimeIndex)
         zhSync()
         setOverlay(Overlay.NONE)
     }
 
     private fun zhCommitTop() {
         if (!zhComposing) return
-        if (zh.candidates.isEmpty()) { zhCommitRaw(); return }
+        if (zh.candidates.isEmpty() && candidateCommits.isEmpty()) { zhCommitRaw(); return }
         val firstCommit = candidateCommits.firstOrNull()
-        if (firstCommit != null && firstCommit in directZhCommits) {
+        val remTail = if (firstCommit != null) partialZhPrefixTail[firstCommit] else null
+        if (firstCommit != null && remTail != null) {
+            commitPartialZhPrefix(firstCommit, remTail)
+        } else if (firstCommit != null && firstCommit in directZhCommits) {
             commitDirectZh(firstCommit, pickedAi = firstCommit == aiSuggestion)
         } else {
             zhKey(Rime.XK_SPACE)
@@ -1887,6 +2144,7 @@ class ImeService : InputMethodService(),
         val raw = if (isT9()) zhDisplay().replace(" ", "") else zh.input
         RimeEngine.clear()
         zh = EMPTY_ZH
+        resetZhLearningChain()
         commitFormatted(currentInputConnection, raw, skipBeforeLen = oldShownLen)
         updateCandidates()
     }

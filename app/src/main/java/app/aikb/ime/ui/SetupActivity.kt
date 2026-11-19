@@ -65,6 +65,7 @@ import app.aikb.ime.engine.PersonalDictionary
 import app.aikb.ime.engine.RecentImageStore
 import app.aikb.ime.engine.RimeEngine
 import app.aikb.ime.engine.UserHistory
+import app.aikb.ime.engine.UserZhLexicon
 import app.aikb.ime.keyboard.*
 import java.io.BufferedInputStream
 import java.io.File
@@ -106,6 +107,7 @@ class SetupActivity : ComponentActivity() {
         enableEdgeToEdge()
         imagePermGranted = RecentImageStore.hasImagePermission(this)
         otpNotifGranted = OtpNotificationService.isNotificationAccessEnabled(this)
+        UserZhLexicon.ensureLoaded(this)
         RimeEngine.start(this, prefsSchema())
         setContent { AppTheme { Screen() } }
         handlePermissionExtras(intent)
@@ -348,12 +350,12 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v2.3 Flagship Offline", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v2.4 Flagship Offline", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "零网络权限 · 实时调参预览 · Gboard 词库导入导出 · 233万词库 · 4万生僻字手写 · 内置端侧 AI 选句",
+                    "零网络权限 · 实时自造词与上下文学词 · Gboard 词库导入导出 · 233万词库 · 4万生僻字手写 · 内置端侧 AI 选句",
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
                     color = Color.White.copy(alpha = 0.90f),
@@ -662,15 +664,30 @@ private class PreviewKeyboardHostView(
             if (previewChinese) {
                 val spelled = formatSpelledPinyin(typed)
                 preeditBar.text = spelled
-                val cands = if (RimeEngine.isReady) {
+                val learned = UserZhLexicon.lookup("rime_ice", typed, simCommitted, AiRanker.sessionMemory())
+                val rimeCands = if (RimeEngine.isReady) {
                     RimeEngine.queryTop("rime_ice", typed, maxCands = 6).ifEmpty { listOf(typed) }
                 } else {
                     listOf(typed)
                 }
-                currentCandidates = cands
-                currentCommits = cands
-                candidateBar.expandable = cands.size > 3
-                candidateBar.setItems(cands, 0)
+                val labels = ArrayList<String>()
+                val commits = ArrayList<String>()
+                learned.topPriority.forEach { w ->
+                    if (w !in commits) {
+                        labels += if (w in learned.contextSparkleSet) "✦ $w" else w
+                        commits += w
+                    }
+                }
+                rimeCands.forEach { w ->
+                    if (w !in commits) {
+                        labels += w
+                        commits += w
+                    }
+                }
+                currentCandidates = labels
+                currentCommits = commits
+                candidateBar.expandable = labels.size > 3
+                candidateBar.setItems(labels, 0)
                 onSimState(simCommitted, spelled, true)
             } else {
                 preeditBar.text = ""
@@ -1672,6 +1689,7 @@ private fun PersonalDictionarySection(prefs: SharedPreferences) {
     val context = LocalContext.current
     val dictFile = remember { context.filesDir.resolve("personal_dict.tsv") }
     var entries by remember { mutableStateOf(PersonalDictionary.allEntries(context)) }
+    var zhLearnedCount by remember { mutableStateOf(UserZhLexicon.learnedCount(context)) }
     var enCount by remember { mutableStateOf(UserHistory(context.filesDir.resolve("en_user.tsv")).totalWordCount()) }
     var showAddForm by remember { mutableStateOf(false) }
     var showAllEntries by remember { mutableStateOf(false) }
@@ -1681,6 +1699,7 @@ private fun PersonalDictionarySection(prefs: SharedPreferences) {
 
     fun notifyImeReload() {
         entries = PersonalDictionary.allEntries(context)
+        zhLearnedCount = UserZhLexicon.learnedCount(context)
         enCount = UserHistory(context.filesDir.resolve("en_user.tsv")).totalWordCount()
         prefs.edit().putLong("reload_user_lexicon", System.currentTimeMillis()).apply()
     }
@@ -1744,7 +1763,7 @@ private fun PersonalDictionarySection(prefs: SharedPreferences) {
             Column(Modifier.weight(1f)) {
                 Text("本地个人词库概览", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface)
                 Text(
-                    "自定义快捷短语 ${entries.size} 条 · 已学习英文个人词条 $enCount 条（纯本地存储）",
+                    "自定义短语 ${entries.size} 条 · 已自学习中文词组 $zhLearnedCount 条 · 英文个人词条 $enCount 条（长按候选词可移除误学词条）",
                     fontSize = 12.sp,
                     color = Secondary(),
                 )
@@ -2010,6 +2029,8 @@ private fun PrivacySection(prefs: SharedPreferences) {
                 .fillMaxWidth()
                 .clickable {
                     UserHistory(context.filesDir.resolve("en_user.tsv")).clear()
+                    UserZhLexicon.clearAll(context)
+                    AiRanker.clearMemory()
                     context.filesDir.resolve("zh_user.tsv").delete()
                     prefs.edit().putLong("clear_history_at", System.currentTimeMillis()).apply()
                     cleared = true

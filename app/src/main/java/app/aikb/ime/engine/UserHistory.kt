@@ -78,7 +78,7 @@ class UserHistory(private val file: File) {
     @Synchronized fun withPrefix(prefix: String, max: Int): List<Pair<String, Int>> {
         if (prefix.isEmpty()) return emptyList()
         return counts.subMap(prefix, true, prefix + Char.MAX_VALUE, false).entries
-            .filter { it.key != prefix && it.value >= 2 }
+            .filter { it.key != prefix && it.value >= 1 }
             .sortedByDescending { it.value }.take(max).map { it.key to it.value }
     }
 

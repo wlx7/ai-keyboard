@@ -23,12 +23,24 @@ class CandidatePanel(context: Context, private val onPick: (Int) -> Unit) : View
     private val sp = resources.displayMetrics.scaledDensity
     var theme: KbTheme = KbTheme.of(context)
         set(v) { field = v; invalidate() }
+    var onLongPressPick: ((Int) -> Unit)? = null
 
     private var items: List<String> = emptyList()
     private var cells: List<RectF> = emptyList()
     private var contentH = 0f
     private var scroll = 0f
     private var pressed = -1
+    private var longPressFired = false
+    private val longPressHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val longPressRunnable = Runnable {
+        val idx = pressed
+        if (!dragging && idx in items.indices && onLongPressPick != null) {
+            longPressFired = true
+            pressed = -1
+            invalidate()
+            onLongPressPick?.invoke(idx)
+        }
+    }
 
     private val rowH = 52 * dp
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
@@ -124,26 +136,40 @@ class CandidatePanel(context: Context, private val onPick: (Int) -> Unit) : View
             MotionEvent.ACTION_DOWN -> {
                 scroller.forceFinished(true)
                 downY = e.y; lastY = e.y; dragging = false
+                longPressFired = false
                 pressed = indexAt(e.x, e.y); invalidate()
+                longPressHandler.removeCallbacks(longPressRunnable)
+                if (pressed >= 0 && onLongPressPick != null) {
+                    longPressHandler.postDelayed(longPressRunnable, 450L)
+                }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!dragging && abs(e.y - downY) > slop) { dragging = true; pressed = -1 }
+                if (!dragging && abs(e.y - downY) > slop) {
+                    dragging = true; pressed = -1
+                    longPressHandler.removeCallbacks(longPressRunnable)
+                }
                 if (dragging) { scroll = (scroll - (e.y - lastY)).coerceIn(0f, maxScroll()); invalidate() }
                 lastY = e.y
             }
             MotionEvent.ACTION_UP -> {
+                longPressHandler.removeCallbacks(longPressRunnable)
                 if (dragging) {
                     velocity!!.computeCurrentVelocity(1000)
                     scroller.fling(0, scroll.toInt(), 0, -velocity!!.yVelocity.toInt(), 0, 0, 0, maxScroll().toInt())
                     postInvalidateOnAnimation()
-                } else {
+                } else if (!longPressFired) {
                     val i = indexAt(e.x, e.y)
                     if (i >= 0) onPick(i)
                 }
+                longPressFired = false
                 pressed = -1; invalidate()
                 velocity?.recycle(); velocity = null
             }
-            MotionEvent.ACTION_CANCEL -> { pressed = -1; dragging = false; velocity?.recycle(); velocity = null; invalidate() }
+            MotionEvent.ACTION_CANCEL -> {
+                longPressHandler.removeCallbacks(longPressRunnable)
+                longPressFired = false
+                pressed = -1; dragging = false; velocity?.recycle(); velocity = null; invalidate()
+            }
         }
         return true
     }

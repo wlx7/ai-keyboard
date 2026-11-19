@@ -329,6 +329,20 @@ JNI_FN(void, nativeClearComposition)(JNIEnv*, jobject) {
     if (ensureSession()) g_api->clear_composition(g_session);
 }
 
+JNI_FN(void, nativeReplaceInput)(JNIEnv* env, jobject, jstring input) {
+    g_abortExplore = true;
+    std::lock_guard<std::mutex> lock(g_lock);
+    g_pendingCommit.clear();
+    if (!ensureSession()) return;
+    std::string rem = fromJava(env, input);
+    g_api->clear_composition(g_session);
+    if (!rem.empty()) {
+        if (!g_api->set_input(g_session, rem.c_str())) {
+            for (unsigned char c : rem) g_api->process_key(g_session, c, 0);
+        }
+    }
+}
+
 JNI_FN(void, nativeSetOption)(JNIEnv* env, jobject, jstring name, jboolean value) {
     std::lock_guard<std::mutex> lock(g_lock);
     if (ensureSession()) g_api->set_option(g_session, fromJava(env, name).c_str(), value ? True : False);

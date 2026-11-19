@@ -182,12 +182,24 @@ object AiRanker {
      * Explores sentence & contextual homophone alternatives with librime and lets the LM pick.
      * Returns null when the AI agrees with librime (or cannot help). Runs on a background thread.
      */
-    fun suggest(context: String, schema: String, input: String, syllables: Int, stale: () -> Boolean = { false }): Suggestion? {
+    fun suggest(
+        context: String,
+        schema: String,
+        input: String,
+        syllables: Int,
+        extraCandidates: List<String> = emptyList(),
+        stale: () -> Boolean = { false },
+    ): Suggestion? {
         val minSyl = minRequiredSyllables(context)
         if (!loaded || syllables < minSyl || !supports(schema)) return null
         val t0 = android.os.SystemClock.elapsedRealtime()
-        val alts = RimeEngine.alternatives(schema, input, syllables)
+        val rawAlts = RimeEngine.alternatives(schema, input, syllables)
         if (stale()) return null
+        val alts = if (extraCandidates.isEmpty() || rawAlts.isEmpty()) rawAlts else buildList {
+            add(rawAlts[0])
+            for (ec in extraCandidates) if (ec.isNotEmpty() && ec !in this) add(ec)
+            for (k in 1 until rawAlts.size) if (rawAlts[k] !in this) add(rawAlts[k])
+        }
         val s = scoreRaw(context, alts, syllables)
         val effMargin = if (syllables == 2) 0.75f else margin
         val top = s?.let { best(it, alts, m = effMargin) }
@@ -225,12 +237,18 @@ object AiRanker {
 
     private val recent = StringBuilder()
 
+    @Synchronized
     fun remember(committed: String) {
         recent.append(committed)
         if (recent.length > 4000) recent.delete(0, recent.length - 3000)
     }
 
+    @Synchronized
+    fun sessionMemory(): String = recent.toString()
+
+    @Synchronized
     fun clearMemory() = recent.setLength(0)
 
+    @Synchronized
     private fun cacheBoost(c: String): Float = if (c.length >= 2 && recent.indexOf(c) >= 0) 1.5f else 0f
 }

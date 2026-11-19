@@ -172,6 +172,15 @@ object PersonalDictionary {
                 } else if (q.length >= 2 && e.shortcut.startsWith(q)) {
                     if (seen.add(e.word)) prefix += Match(e.word, exactShortcut = false)
                 }
+            } else if (chinese && e.word.any(ChinesePredictor::isCjk) && HanziPinyin.isLoaded) {
+                if (HanziPinyin.matchesPinyin(e.word, q)) {
+                    if (seen.add(e.word)) exact += Match(e.word, exactShortcut = true)
+                } else {
+                    val py = HanziPinyin.primaryPinyin(e.word)
+                    if (py != null && q.length >= 2 && py.startsWith(q)) {
+                        if (seen.add(e.word)) prefix += Match(e.word, exactShortcut = false)
+                    }
+                }
             } else if (!chinese && q.length >= 2 && e.word.lowercase().startsWith(q) && e.word.lowercase() != q) {
                 if (seen.add(e.word)) prefix += Match(e.word, exactShortcut = false)
             }
@@ -327,6 +336,10 @@ object PersonalDictionary {
             val w = e.word.replace('\t', ' ').replace('\n', ' ')
             val loc = e.locale.ifEmpty { inferLocale(w) }
             outRows += "${e.shortcut}\t$w\t$loc"
+        }
+        UserZhLexicon.allEntries().forEach { le ->
+            val w = le.word.replace('\t', ' ').replace('\n', ' ')
+            outRows += "${normalizeShortcut(le.code)}\t$w\tzh-CN"
         }
         for ((py, word) in rimeUserWords) {
             if (word.length >= 2) outRows += "${normalizeShortcut(py)}\t$word\tzh-CN"

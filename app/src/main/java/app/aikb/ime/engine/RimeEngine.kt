@@ -248,6 +248,12 @@ object RimeEngine {
 
     fun clear() { if (isReady) Rime.nativeClearComposition() }
 
+    fun replaceInput(newInput: String) {
+        if (!isReady) return
+        if (newInput.isEmpty()) Rime.nativeClearComposition()
+        else Rime.nativeReplaceInput(newInput)
+    }
+
     fun selectSchema(id: String) {
         if (!isReady) return
         if (Rime.nativeSelectSchema(id)) currentSchema = id

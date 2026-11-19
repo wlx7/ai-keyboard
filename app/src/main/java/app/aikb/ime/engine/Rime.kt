@@ -19,6 +19,7 @@ object Rime {
     @JvmStatic external fun nativeSelectCandidate(index: Int): Boolean
     @JvmStatic external fun nativeDeleteCandidate(index: Int): Boolean
     @JvmStatic external fun nativeClearComposition()
+    @JvmStatic external fun nativeReplaceInput(input: String)
     @JvmStatic external fun nativeSetOption(name: String, value: Boolean)
     @JvmStatic external fun nativeGetOption(name: String): Boolean
     @JvmStatic external fun nativeSelectSchema(id: String): Boolean

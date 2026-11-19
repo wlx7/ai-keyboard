@@ -49,6 +49,7 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         }
 
     var onToolbarAction: ((ToolbarAction) -> Unit)? = null
+    var onLongPressPick: ((Int) -> Unit)? = null
 
     var menuActive = false
         set(v) { if (field != v) { field = v; invalidate() } }
@@ -104,6 +105,17 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     private var downX = 0f
     private var lastX = 0f
     private var dragging = false
+    private var longPressFired = false
+    private val longPressHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val longPressRunnable = Runnable {
+        val idx = pressedIndex
+        if (!dragging && idx in items.indices && onLongPressPick != null) {
+            longPressFired = true
+            pressedIndex = -1
+            invalidate()
+            onLongPressPick?.invoke(idx)
+        }
+    }
 
     private val textSize get() = 17.5f * sp * prefs.candFontScale
 
@@ -536,12 +548,19 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 scroller.forceFinished(true)
-                downX = e.x; lastX = e.x; dragging = false
+                downX = e.x; lastX = e.x; dragging = false; longPressFired = false
                 pressedIndex = indexAt(e.x)
+                longPressHandler.removeCallbacks(longPressRunnable)
+                if (pressedIndex in items.indices && onLongPressPick != null) {
+                    longPressHandler.postDelayed(longPressRunnable, 450L)
+                }
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
-                if (!dragging && abs(e.x - downX) > slop && maxScroll() > 0f) { dragging = true; pressedIndex = -1 }
+                if (!dragging && abs(e.x - downX) > slop) {
+                    longPressHandler.removeCallbacks(longPressRunnable)
+                    if (maxScroll() > 0f) { dragging = true; pressedIndex = -1 }
+                }
                 if (dragging) {
                     scroll = (scroll - (e.x - lastX)).coerceIn(0f, maxScroll())
                     invalidate()
@@ -549,19 +568,23 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
                 lastX = e.x
             }
             MotionEvent.ACTION_UP -> {
+                longPressHandler.removeCallbacks(longPressRunnable)
                 if (dragging) {
                     velocity!!.computeCurrentVelocity(1000)
                     scroller.fling(scroll.toInt(), 0, -velocity!!.xVelocity.toInt(), 0, 0, maxScroll().toInt(), 0, 0)
                     postInvalidateOnAnimation()
-                } else {
+                } else if (!longPressFired) {
                     val i = indexAt(e.x)
                     if (i in items.indices) onPick(i)
                 }
+                longPressFired = false
                 pressedIndex = -1
                 velocity?.recycle(); velocity = null
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
+                longPressHandler.removeCallbacks(longPressRunnable)
+                longPressFired = false
                 pressedIndex = -1; dragging = false
                 velocity?.recycle(); velocity = null
                 invalidate()
