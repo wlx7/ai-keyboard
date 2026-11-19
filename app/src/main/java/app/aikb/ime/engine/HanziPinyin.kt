@@ -13,7 +13,7 @@ import java.util.concurrent.Executors
  *
  * Powers:
  *   1. Zero-shot Context Homophone Extraction (spots `《禁色》` in chat context and matches `jinse` in <0.05 ms).
- *   2. Cross-engine learning (words entered via Handwriting, Voice, or Clipboard immediately gain Pinyin codes).
+ *   2. Cross-engine learning (words entered via Handwriting or Clipboard immediately gain Pinyin codes).
  *   3. Polyphone-accurate matching (`音乐 -> yinyue`, `快乐 -> kuaile`, `银行 -> yinhang`).
  */
 object HanziPinyin {

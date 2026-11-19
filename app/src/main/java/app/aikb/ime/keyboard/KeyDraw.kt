@@ -191,17 +191,17 @@ object KeyDraw {
         c.drawLine(cx - w * 0.45f, cy + h * 0.42f, cx + w * 0.25f, cy + h * 0.42f, stroke)
     }
 
-    /** Microphone icon. */
-    fun drawMicIcon(c: Canvas, cx: Float, cy: Float, s: Float, color: Int, stroke: Paint, dp: Float) {
+    /** One-handed docked keyboard icon (shows outer screen frame + docked mini keyboard). */
+    fun drawOneHandIcon(c: Canvas, cx: Float, cy: Float, s: Float, align: Int, color: Int, fill: Paint, stroke: Paint, dp: Float) {
         stroke.color = color
-        stroke.strokeWidth = 1.65f * dp
-        val mw = s * 0.20f
-        val mh = s * 0.34f
-        c.drawRoundRect(cx - mw, cy - mh - 1.5f * dp, cx + mw, cy + mh * 0.35f, mw, mw, stroke)
-        val aw = s * 0.36f
-        c.drawArc(cx - aw, cy - mh * 0.55f, cx + aw, cy + mh * 0.75f, 0f, 180f, false, stroke)
-        c.drawLine(cx, cy + mh * 0.75f, cx, cy + mh * 1.25f, stroke)
-        c.drawLine(cx - mw * 0.9f, cy + mh * 1.25f, cx + mw * 0.9f, cy + mh * 1.25f, stroke)
+        stroke.strokeWidth = 1.55f * dp
+        val w = s * 0.44f
+        val h = s * 0.36f
+        c.drawRoundRect(cx - w, cy - h, cx + w, cy + h, 2.5f * dp, 2.5f * dp, stroke)
+        fill.color = (color and 0x00FFFFFF) or 0x44000000
+        val innerL = if (align < 0) cx - w + 1.8f * dp else cx - w * 0.22f
+        val innerR = if (align < 0) cx + w * 0.22f else cx + w - 1.8f * dp
+        c.drawRoundRect(innerL, cy - h * 0.55f, innerR, cy + h - 1.8f * dp, 1.8f * dp, 1.8f * dp, fill)
     }
 
     /** Gear / settings icon. */

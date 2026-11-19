@@ -12,7 +12,7 @@ import android.view.View
 /**
  * Quick feature drawer opened from `[⊞]`:
  *   1) Input mode pill switcher (全拼 / 九宫格 / 双拼 / 手写 / 五笔·仓颉)
- *   2) 2×4 sleek feature tiles (剪贴板 / 图片截图 / 语音输入 / 键盘大小 / 简繁切换 / 切换输入法 / 个性设置 / 收起键盘)
+ *   2) 2×4 sleek feature tiles (剪贴板 / 图片截图 / 单手模式 / 键盘大小 / 简繁切换 / 切换输入法 / 个性设置 / 收起键盘)
  *   3) Compact bottom text-editing strip (← / → / 全选 / 复制 / 粘贴 / ⌫)
  */
 @SuppressLint("ViewConstructor")
@@ -20,7 +20,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
 
     enum class InputMode { QUANPIN, T9, SHUANGPIN, HANDWRITING, SHAPE }
     enum class EditAction { LEFT, RIGHT, SELECT_ALL, COPY, PASTE, DELETE }
-    enum class Tile { CLIPBOARD, IMAGES, VOICE, RESIZE, TRADITIONAL, SWITCH_IME, SETTINGS, HIDE }
+    enum class Tile { CLIPBOARD, IMAGES, ONE_HANDED, RESIZE, TRADITIONAL, SWITCH_IME, SETTINGS, HIDE }
 
     interface Listener {
         fun onSelectInputMode(mode: InputMode)
@@ -38,6 +38,8 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
     var shapeLabel: String = "五笔"
         set(v) { field = v; invalidate() }
     var traditional: Boolean = false
+        set(v) { field = v; invalidate() }
+    var oneHandAlign: Int = 0
         set(v) { field = v; invalidate() }
     var clipCount: Int = 0
         set(v) { field = v; invalidate() }
@@ -142,8 +144,9 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             val iconY = rc.top + rc.height() * 0.37f
             val labelY = rc.top + rc.height() * 0.78f
             val mutedTile = (tile == Tile.CLIPBOARD && !clipboardEnabled) || (tile == Tile.IMAGES && !imagesSupported)
+            val activeToggle = (tile == Tile.TRADITIONAL && traditional) || (tile == Tile.ONE_HANDED && oneHandAlign != 0)
             val iconColor = when {
-                tile == Tile.TRADITIONAL && traditional -> theme.accent
+                activeToggle -> theme.accent
                 mutedTile -> theme.textSecondary
                 else -> theme.text
             }
@@ -151,7 +154,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             when (tile) {
                 Tile.CLIPBOARD -> KeyDraw.drawClipboardIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
                 Tile.IMAGES -> KeyDraw.drawImageIcon(c, cx, iconY, 18.5f * dp, iconColor, fill, stroke, path, dp)
-                Tile.VOICE -> KeyDraw.drawMicIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
+                Tile.ONE_HANDED -> KeyDraw.drawOneHandIcon(c, cx, iconY, 18.5f * dp, oneHandAlign, iconColor, fill, stroke, dp)
                 Tile.RESIZE -> KeyDraw.drawResizeIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
                 Tile.TRADITIONAL -> {
                     val bRc = RectF(cx - 9.5f * dp, iconY - 9.5f * dp, cx + 9.5f * dp, iconY + 9.5f * dp)
@@ -174,7 +177,11 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
                     else -> "剪贴板"
                 }
                 Tile.IMAGES -> if (imagesSupported) "图片/截图" else "图片(不支持)"
-                Tile.VOICE -> "离线语音"
+                Tile.ONE_HANDED -> when {
+                    oneHandAlign < 0 -> "左手单手"
+                    oneHandAlign > 0 -> "右手单手"
+                    else -> "单手模式"
+                }
                 Tile.RESIZE -> "键盘大小"
                 Tile.TRADITIONAL -> if (traditional) "繁体已开" else "简繁切换"
                 Tile.SWITCH_IME -> "切换键盘"
@@ -185,11 +192,11 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             KeyDraw.drawKeyText(
                 c, title, labelRc, 11.8f * u,
                 when {
-                    tile == Tile.TRADITIONAL && traditional -> theme.accent
+                    activeToggle -> theme.accent
                     mutedTile -> theme.textSecondary
                     else -> theme.text
                 },
-                text, dp, padH = 2 * dp, bold = tile == Tile.TRADITIONAL && traditional,
+                text, dp, padH = 2 * dp, bold = activeToggle,
             )
         }
 

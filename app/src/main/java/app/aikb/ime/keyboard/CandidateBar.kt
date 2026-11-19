@@ -22,7 +22,7 @@ import kotlin.math.abs
  * Top 45dp strip of the keyboard:
  *   - While typing / showing candidates: smooth pill-highlighted candidate strip (`candFontScale`).
  *   - When idle: modern toolbar with:
- *       `[⊞]` `[✍ 手写 / ⌨ 键盘]` `[📋 剪贴板]` `[🖼 图片]` ... `[🎤 语音]` `[⌄ 收起]`
+ *       `[⊞]` `[✍ 手写 / ⌨ 键盘]` `[📋 剪贴板]` `[🖼 图片]` ... `[⌄ 收起]`
  *     plus Gboard-style one-tap **Fresh Screenshot / Photo Chip** OR **Fresh Clipboard Paste Chip**!
  */
 @SuppressLint("ViewConstructor")
@@ -33,7 +33,7 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         PASTE_OTP, DISMISS_OTP,
         PASTE_FRESH, DISMISS_FRESH,
         SEND_FRESH_IMAGE, DISMISS_FRESH_IMAGE,
-        VOICE, HIDE,
+        HIDE,
     }
 
     private val dp = resources.displayMetrics.density
@@ -161,7 +161,6 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     private val imgRect = RectF()
     private val freshBubbleRect = RectF()
     private val freshCloseRect = RectF()
-    private val voiceRect = RectF()
     private val hideRect = RectF()
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -185,7 +184,6 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
             imgRect.setEmpty()
         }
         hideRect.set(w - 44 * dp, 4 * dp, w - 4 * dp, h - 4 * dp)
-        voiceRect.set(w - 86 * dp, 4 * dp, w - 46 * dp, h - 4 * dp)
     }
 
     private fun relayout() {
@@ -287,8 +285,8 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         val otp = freshOtpCode
         val fImgLabel = freshImageLabel
         val fClip = freshClip
+        val maxChipRight = hideRect.left - 6 * dp
         if (otp != null) {
-            val maxChipRight = voiceRect.left - 6 * dp
             val src = freshOtpSource?.takeIf { it.isNotBlank() } ?: "信息"
             val preview = "🔑 $otp  · 来自「$src」"
             paint.typeface = Typeface.DEFAULT_BOLD
@@ -314,7 +312,6 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
             drawSmallCloseX(c, freshCloseRect.centerX(), cy)
         } else if (fImgLabel != null) {
-            val maxChipRight = voiceRect.left - 6 * dp
             paint.typeface = Typeface.DEFAULT_BOLD
             paint.textSize = 12.8f * u
             val thumbSpace = if (freshImageThumb != null) 28 * dp else 8 * dp
@@ -354,7 +351,6 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
             drawSmallCloseX(c, freshCloseRect.centerX(), cy)
         } else if (fClip != null) {
-            val maxChipRight = voiceRect.left - 6 * dp
             val preview = "粘贴: " + fClip.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
             paint.typeface = Typeface.DEFAULT
             paint.textSize = 13 * u
@@ -411,7 +407,7 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
             }
 
             // `[🖼]` Recent Photos & Screenshots icon (shown only when editor accepts images)
-            if (showImageIcon && !imgRect.isEmpty && imgRect.right <= voiceRect.left - 2 * dp) {
+            if (showImageIcon && !imgRect.isEmpty && imgRect.right <= hideRect.left - 2 * dp) {
                 if (pressedToolbar == ToolbarAction.IMAGES) {
                     fill.color = theme.keyPressed
                     c.drawRoundRect(imgRect, 9 * dp, 9 * dp, fill)
@@ -420,13 +416,7 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
             }
         }
 
-        // 3) Right Voice icon + Collapse chevron
-        if (pressedToolbar == ToolbarAction.VOICE) {
-            fill.color = theme.keyPressed
-            c.drawRoundRect(voiceRect, 9 * dp, 9 * dp, fill)
-        }
-        KeyDraw.drawMicIcon(c, voiceRect.centerX(), cy, 18.5f * dp, theme.text, stroke, dp)
-
+        // 3) Right Collapse chevron
         if (pressedToolbar == ToolbarAction.HIDE) {
             fill.color = theme.keyPressed
             c.drawRoundRect(hideRect, 9 * dp, 9 * dp, fill)
@@ -489,9 +479,8 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         } else {
             if (hwRect.contains(x, y)) return ToolbarAction.HANDWRITING_TOGGLE
             if (clipRect.contains(x, y)) return ToolbarAction.CLIPBOARD
-            if (imgRect.right <= voiceRect.left - 2 * dp && imgRect.contains(x, y)) return ToolbarAction.IMAGES
+            if (imgRect.right <= hideRect.left - 2 * dp && imgRect.contains(x, y)) return ToolbarAction.IMAGES
         }
-        if (voiceRect.contains(x, y)) return ToolbarAction.VOICE
         if (hideRect.contains(x, y)) return ToolbarAction.HIDE
         return null
     }

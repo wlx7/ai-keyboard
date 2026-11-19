@@ -85,14 +85,6 @@ class SetupActivity : ComponentActivity() {
     private var imagePermGranted by mutableStateOf(false)
     private var otpNotifGranted by mutableStateOf(false)
 
-    private val micPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        if (intent?.getBooleanExtra(EXTRA_REQUEST_MIC, false) == true && granted) {
-            finish()
-        }
-    }
-
     private val imgPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { _ ->
@@ -123,15 +115,12 @@ class SetupActivity : ComponentActivity() {
     }
 
     private fun handlePermissionExtras(intent: Intent?) {
-        if (intent?.getBooleanExtra(EXTRA_REQUEST_MIC, false) == true) {
-            micPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
-        } else if (intent?.getBooleanExtra(EXTRA_REQUEST_IMAGES, false) == true) {
+        if (intent?.getBooleanExtra(EXTRA_REQUEST_IMAGES, false) == true) {
             imgPermissionLauncher.launch(RecentImageStore.requiredPermissions())
         }
     }
 
     companion object {
-        const val EXTRA_REQUEST_MIC = "request_mic"
         const val EXTRA_REQUEST_IMAGES = "request_images"
     }
 
@@ -350,7 +339,7 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v3.1 Hybrid Octagram + LLM", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v3.2 Hybrid Octagram + LLM", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
@@ -2125,7 +2114,7 @@ private fun PrivacySection(prefs: SharedPreferences) {
         }
     }
     Text(
-        "Keylo 在 AndroidManifest 中未声明 INTERNET 网络权限，操作系统内核层面阻断一切联网可能。您的所有输入、语音、手写、个人词典、验证码提取、剪贴板与图片均 100% 留在手机本地。",
+        "Keylo 在 AndroidManifest 中未声明 INTERNET 网络权限与 RECORD_AUDIO 麦克风权限，操作系统内核层面阻断一切联网与录音可能。您的所有输入、手写、个人词典、验证码提取、剪贴板与图片均 100% 留在手机本地。",
         fontSize = 12.5.sp,
         lineHeight = 18.sp,
         color = Secondary(),

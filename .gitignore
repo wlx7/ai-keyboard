@@ -9,9 +9,8 @@ local.properties
 /third_party/
 # native build intermediates
 .cxx/
-# generated from tools/data by tools/build_rime_data.sh & tools/fetch_sherpa.sh
+# generated from tools/data by tools/build_rime_data.sh
 /app/src/main/assets/rime/
-/app/src/main/assets/asr/
 /app/src/embeddedAiAssets/
 /tools/distill/.venv/
 /tools/build_gram/ngrams.tsv

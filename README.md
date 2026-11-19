@@ -1,23 +1,23 @@
 # Keylo — Flagship Offline AI Keyboard for Android
 
-**完全离线的双擎旗舰 Android 输入法：零网络权限 · 内置 Octagram 毫秒级语法词图（兼容万象 `.gram` 导入）· 内置 `Q8_0` 高精词嵌入端侧大模型 · 实时自造词与上下文学词 · 233 万搜狗级大词库 · 4 万字生僻字手写**
+**完全离线的双擎旗舰 Android 输入法：零网络与零麦克风权限 · 内置 Octagram 毫秒级语法词图（兼容万象 `.gram` 导入）· 内置 `Q8_0` 高精词嵌入端侧大模型 · 全句上下文联想 · 实时自造词学习 · 233 万搜狗级大词库 · 4 万字生僻字手写**
 
-Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET`，从操作系统权限机制上杜绝任何键盘输入、语音、个人词典、验证码、剪贴板或图片上传的可能，同时通过**「第一层 0ms Octagram N-gram 词图底座 + 第二层跨句 Transformer 大模型」双引擎架构**，在短句零延迟体验与长句跨分句语境消歧上双向对齐并超越主流语法模型方案。
+Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET` 与 `android.permission.RECORD_AUDIO`，从操作系统权限机制上杜绝任何键盘输入、个人词典、验证码、剪贴板或图片上传及后台录音的可能，同时通过**「第一层 0ms Octagram N-gram 词图底座 + 第二层跨句 Transformer 大模型」双引擎架构**，在短句零延迟体验与长句跨分句语境消歧/续写上双向对齐并超越主流语法模型方案。
 
 ---
 
-## 下载安装（Release v3.1.0）
+## 下载安装（Release v3.2.0）
 
 前往 [**Releases 页面**](https://github.com/wlx7/ai-keyboard/releases/latest) 按需选择下载：
 
-1. **🌟 `keylo-3.1.0-arm64.apk`（双擎完整旗舰版，主力推荐）**
-   - 直接内嵌 **`Keylo-460K Octagram 语法词图库`（`5.0 MiB`）** + **`Keylo-285M v2` 端侧专属大模型（`Q8_0` 高精词嵌入，约 `185 MiB`）** + **9 万词头多词/诗词上下句联想库** + **233 万条中文大词库** + **4 万字生僻字手写** + **离线流式语音模型**，安装即享完整双引擎体验，无需额外配置（包名兼容旧版，可直接覆盖升级）。
-2. **⚡ `keylo-3.1.0-lite-arm64.apk`（精简外挂版，内置 Octagram 语法库，约 `93 MiB`）**
-   - 仍完整内置 `Keylo-460K Octagram` 毫秒级语法模型、9 万词头多词联想、233 万词库、离线语音与全字集手写；可按需在设置页导入外部 `.gguf` 大模型或完整版 `wanxiang-lts-zh-hans.gram`。
+1. **🌟 `keylo-3.2.0-arm64.apk`（双擎完整旗舰版，主力推荐）**
+   - 直接内嵌 **`Keylo-460K Octagram 语法词图库`（`5.0 MiB`）** + **`Keylo-285M v2` 端侧专属大模型（`Q8_0` 高精词嵌入，约 `185 MiB`）** + **9 万词头多词/诗词上下句联想库** + **233 万条中文大词库** + **4 万字生僻字手写**，安装即享完整双引擎体验，无需额外配置（包名兼容旧版，可直接覆盖升级，彻底移除冗余离线语音体积立减 ~35 MiB）。
+2. **⚡ `keylo-3.2.0-lite-arm64.apk`（精简外挂版，内置 Octagram 语法库，仅 `52 MiB`）**
+   - 仍完整内置 `Keylo-460K Octagram` 毫秒级语法模型、9 万词头多词联想、233 万词库与全字集手写；可按需在设置页导入外部 `.gguf` 大模型或完整版 `wanxiang-lts-zh-hans.gram`。
 
 ---
 
-## v3.1 核心特性一览
+## v3.2 核心特性一览
 
 - **双擎全句上下文「输入后联想」（`ChinesePredictor v2` + `Llm.nativePredict`）**
   - **第一层（`<0.05 ms` 9 万词头多词 N-gram + 千古名句/成语对句库）**：支持 `2~7` 字多词联合上文（如 `今天天气 → 真不错`、`这个问题 → 怎么解决`）与古诗文名句上下句（如 `清风徐来 / 清风徐来， → 水波不兴`、`远上寒山石径斜， → 白云生处有人家`、`落霞与孤鹜齐飞 → 秋水共长天一色`）；严禁将多字词尾降级拆成单字黏着词素或被偶发单字历史抢占。
@@ -29,7 +29,7 @@ Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET`，从
 
 - **全链路实时自学习词库与上下文零样本学词（`UserZhLexicon` + `HanziPinyin`）**
   - **分段组词与单字连打记忆**：无论在连拼中逐段选字（如 `jinse` 选 `禁` + `色`、或在整句 `woxihuanjinsede` 中选字自动剥离虚词学得 `禁色`），还是分开逐字选字（`jin` 选 `禁` 后紧接 `se` 选 `色`），均立即写入本地持久化自学习词库，下次输入 `jinse`、简拼 `js`、前缀 `jins` 或整句 `jinsezheshouge` 直接置顶首选（`✦ 禁色这首歌`）。
-  - **上下文零样本同音感知**：只要当前输入框或近期输入记忆中出现过新词/歌名/专有名词（如《禁色》《达明一派》），首次输入 `jinse` 即刻零样本提取置顶 **`✦ 禁色`** 并注入端侧大模型重排候选池；手写、语音及无快捷码个人词条自动建立多音字拼音索引；**长按任意候选词即可一键忘词**。
+  - **上下文零样本同音感知**：只要当前输入框或近期输入记忆中出现过新词/歌名/专有名词（如《禁色》《达明一派》），首次输入 `jinse` 即刻零样本提取置顶 **`✦ 禁色`** 并注入端侧大模型重排候选池；手写及无快捷码个人词条自动建立多音字拼音索引；**长按任意候选词即可一键忘词**。
 - **Gboard 兼容个人词典与词库导入导出**
   - 原生兼容 **`# Gboard Dictionary version:1` 标准 `.zip`（内含 `dictionary.txt`）双向导入导出**（含自学习中文词组同步备份），同时支持导入 Rime `.dict.yaml` / `.userdb.txt` 与纯文本词表。
 - **克制精准的双语纠错与端侧 AI 选句**
@@ -50,7 +50,6 @@ Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET`，从
 # 首次拉取第三方预编译库与词库源码
 bash tools/fetch_prebuilt.sh
 bash tools/fetch_llama.sh
-bash tools/fetch_sherpa.sh
 bash tools/fetch_rime_sources.sh
 bash tools/build_rime_data.sh
 

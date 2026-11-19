@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Deliberately NO INTERNET permission: the keyboard cannot send anything anywhere. -->
+    <!-- Deliberately NO INTERNET and NO RECORD_AUDIO permissions: strictly offline, zero mic access. -->
     <uses-permission android:name="android.permission.VIBRATE" />
-    <!-- Optional runtime permission, requested only if the user taps Voice Input. -->
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Optional runtime permissions, requested only if the user enables/opens Recent Photos & Screenshots. -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />

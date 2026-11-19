@@ -38,7 +38,6 @@ import app.aikb.ime.engine.EnglishDictionary
 import app.aikb.ime.engine.EnglishEngine
 import app.aikb.ime.engine.EnglishResult
 import app.aikb.ime.engine.HandwritingEngine
-import app.aikb.ime.engine.OfflineAsrEngine
 import app.aikb.ime.engine.OtpStore
 import app.aikb.ime.engine.PersonalDictionary
 import app.aikb.ime.engine.PinyinCorrector
@@ -69,7 +68,6 @@ import app.aikb.ime.keyboard.ResizeOverlay
 import app.aikb.ime.keyboard.ShiftState
 import app.aikb.ime.keyboard.T9View
 import app.aikb.ime.keyboard.ToolPanel
-import app.aikb.ime.keyboard.VoicePanel
 import app.aikb.ime.ui.SetupActivity
 
 class ImeService : InputMethodService(),
@@ -79,11 +77,10 @@ class ImeService : InputMethodService(),
     HandwritingView.Listener,
     ToolPanel.Listener,
     ClipboardPanel.Listener,
-    VoicePanel.Listener,
     ImagePanel.Listener,
     ResizeOverlay.Listener {
 
-    private enum class Overlay { NONE, EMOJI, CANDIDATES, TOOLS, CLIPBOARD, VOICE, IMAGES, RESIZE }
+    private enum class Overlay { NONE, EMOJI, CANDIDATES, TOOLS, CLIPBOARD, IMAGES, RESIZE }
 
     private lateinit var prefs: SharedPreferences
     private var kbPrefs = KeyboardPrefs()
@@ -105,7 +102,6 @@ class ImeService : InputMethodService(),
     private lateinit var candidatePanel: CandidatePanel
     private lateinit var toolPanel: ToolPanel
     private lateinit var clipboardPanel: ClipboardPanel
-    private lateinit var voicePanel: VoicePanel
     private lateinit var imagePanel: ImagePanel
     private lateinit var resizeOverlay: ResizeOverlay
     private lateinit var t9: T9View
@@ -288,7 +284,6 @@ class ImeService : InputMethodService(),
         recentImageStore.stopObserving()
         OtpStore.removeListener(otpListener)
         RimeEngine.removeStateListener(rimeListener)
-        OfflineAsrEngine.unload()
         aiWorker.shutdownNow()
         hwWorker.shutdownNow()
         super.onDestroy()
@@ -313,7 +308,6 @@ class ImeService : InputMethodService(),
         }
         toolPanel = ToolPanel(this, this).apply { visibility = View.GONE }
         clipboardPanel = ClipboardPanel(this, clipboardStore, this).apply { visibility = View.GONE }
-        voicePanel = VoicePanel(this, this).apply { visibility = View.GONE }
         imagePanel = ImagePanel(this, recentImageStore, this).apply { visibility = View.GONE }
         resizeOverlay = ResizeOverlay(this, this).apply { visibility = View.GONE }
         t9 = T9View(this, this).apply { visibility = View.GONE }
@@ -334,7 +328,6 @@ class ImeService : InputMethodService(),
             addView(candidatePanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(toolPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(clipboardPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-            addView(voicePanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(imagePanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(resizeOverlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         }
@@ -372,7 +365,7 @@ class ImeService : InputMethodService(),
 
         preeditBar.theme = t
         keyboard.theme = t; candidates.theme = t; emoji.theme = t; previewOverlay.theme = t
-        candidatePanel.theme = t; toolPanel.theme = t; clipboardPanel.theme = t; voicePanel.theme = t
+        candidatePanel.theme = t; toolPanel.theme = t; clipboardPanel.theme = t
         imagePanel.theme = t; resizeOverlay.theme = t
         t9.theme = t; handwriting.theme = t
         inlineAutofillBar?.theme = t
@@ -472,7 +465,6 @@ class ImeService : InputMethodService(),
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
         uiHandler.removeCallbacks(clipTick)
-        if (::voicePanel.isInitialized) voicePanel.stopAndRelease()
         if (::preeditBar.isInitialized) preeditBar.text = ""
         if (::handwriting.isInitialized) { handwriting.clearCanvas(notify = false); handwriting.hasPendingComposition = false }
         hasInlineAutofill = false
@@ -629,7 +621,7 @@ class ImeService : InputMethodService(),
     private fun syncToolbarState() {
         if (!::candidates.isInitialized) return
         candidates.handwritingActive = handwritingMode
-        candidates.menuActive = overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.VOICE, Overlay.IMAGES, Overlay.RESIZE)
+        candidates.menuActive = overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.IMAGES, Overlay.RESIZE)
         candidates.showClipboardIcon = kbPrefs.clipboardEnabled
         candidates.hasClips = kbPrefs.clipboardEnabled && clipboardStore.hasAny()
         candidates.freshClip = if (!kbPrefs.clipboardEnabled || scene.kind == FieldKind.PASSWORD) null else clipboardStore.freshClip()
@@ -656,6 +648,7 @@ class ImeService : InputMethodService(),
             val shapeSchema = prefs.getString(KEY_LAST_SHAPE, "wubi86_jidian")
             toolPanel.shapeLabel = if (shapeSchema == "cangjie5") "仓颉" else "五笔"
             toolPanel.traditional = RimeEngine.traditional
+            toolPanel.oneHandAlign = if (kbPrefs.widthRatio < 0.98f) kbPrefs.oneHandAlign else 0
             toolPanel.clipboardEnabled = kbPrefs.clipboardEnabled
             toolPanel.imagesSupported = acceptsImages
             toolPanel.clipCount = if (kbPrefs.clipboardEnabled) clipboardStore.count() else 0
@@ -675,7 +668,6 @@ class ImeService : InputMethodService(),
 
     private fun setOverlay(next: Overlay) {
         if (!::keyboard.isInitialized) { overlay = next; return }
-        if (overlay == Overlay.VOICE && next != Overlay.VOICE) voicePanel.stopAndRelease()
         val resolved = if (next == Overlay.CANDIDATES && !zhComposing && !hwComposing) Overlay.NONE else next
         overlay = resolved
         candidates.expanded = resolved == Overlay.CANDIDATES
@@ -696,10 +688,6 @@ class ImeService : InputMethodService(),
             Overlay.CLIPBOARD -> {
                 clipboardPanel.layoutParams = clipboardPanel.layoutParams.apply { height = h }
                 clipboardPanel.refresh()
-            }
-            Overlay.VOICE -> {
-                voicePanel.layoutParams = voicePanel.layoutParams.apply { height = h }
-                voicePanel.onShown()
             }
             Overlay.IMAGES -> {
                 imagePanel.layoutParams = imagePanel.layoutParams.apply { height = h }
@@ -726,7 +714,7 @@ class ImeService : InputMethodService(),
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
                 showNextPredictions = false; showZhPredictions = false
                 updateCandidates()
-                val panelOpen = overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.VOICE, Overlay.IMAGES, Overlay.RESIZE)
+                val panelOpen = overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.IMAGES, Overlay.RESIZE)
                 setOverlay(if (panelOpen) Overlay.NONE else Overlay.TOOLS)
             }
             CandidateBar.ToolbarAction.HANDWRITING_TOGGLE -> toggleHandwriting()
@@ -777,13 +765,6 @@ class ImeService : InputMethodService(),
             CandidateBar.ToolbarAction.DISMISS_FRESH_IMAGE -> {
                 recentImageStore.dismissFresh()
                 syncToolbarState()
-            }
-            CandidateBar.ToolbarAction.VOICE -> {
-                if (zhComposing) zhCommitTop()
-                if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-                showNextPredictions = false; showZhPredictions = false
-                updateCandidates()
-                setOverlay(if (overlay == Overlay.VOICE) Overlay.NONE else Overlay.VOICE)
             }
             CandidateBar.ToolbarAction.HIDE -> {
                 setOverlay(Overlay.NONE)
@@ -857,7 +838,20 @@ class ImeService : InputMethodService(),
                     setOverlay(Overlay.IMAGES)
                 }
             }
-            ToolPanel.Tile.VOICE -> setOverlay(Overlay.VOICE)
+            ToolPanel.Tile.ONE_HANDED -> {
+                val curActive = kbPrefs.widthRatio < 0.98f && kbPrefs.oneHandAlign != 0
+                val (nextRatio, nextAlign) = when {
+                    !curActive -> 0.82f to 1
+                    kbPrefs.oneHandAlign > 0 -> 0.82f to -1
+                    else -> 1.00f to 0
+                }
+                prefs.edit()
+                    .putFloat(KeyboardPrefs.KEY_WIDTH_RATIO, nextRatio)
+                    .putInt(KeyboardPrefs.KEY_ONE_HAND_ALIGN, nextAlign)
+                    .apply()
+                applyPrefsAndTheme()
+                syncToolbarState()
+            }
             ToolPanel.Tile.RESIZE -> setOverlay(Overlay.RESIZE)
             ToolPanel.Tile.TRADITIONAL -> {
                 val next = !RimeEngine.traditional
@@ -956,40 +950,6 @@ class ImeService : InputMethodService(),
     override fun onClipboardChanged() = syncToolbarState()
 
     override fun onClipboardClose() = setOverlay(Overlay.NONE)
-
-    override fun onVoiceCommit(text: String) {
-        val ic = currentInputConnection ?: return
-        ic.finishComposingText()
-        val prevZh = trailingZhWordBeforeCursor()
-        commitFormatted(ic, text)
-        resetZhLearningChain()
-        if (text.any(ChinesePredictor::isCjk)) {
-            if (scene.kind != FieldKind.PASSWORD) UserZhLexicon.observeHandwritingOrVoice(text, persist = scene.learn)
-            recordChineseCommit(prevZh, text)
-            updateCandidates()
-        }
-    }
-
-    override fun onVoicePartial(text: String) {
-        val ic = currentInputConnection ?: return
-        if (text.isEmpty()) ic.finishComposingText() else ic.setComposingText(text, 1)
-    }
-
-    override fun onVoiceDelete() = onDeleteDown(false)
-
-    override fun onVoiceClose() {
-        setOverlay(Overlay.NONE)
-        updateCandidates()
-    }
-
-    override fun onVoiceRequestPermission() {
-        requestHideSelf(0)
-        startActivity(
-            Intent(this, SetupActivity::class.java)
-                .putExtra(SetupActivity.EXTRA_REQUEST_MIC, true)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
-    }
 
     private fun trailingZhWordBeforeCursor(skipSuffixLen: Int = 0): String? {
         val raw = currentInputConnection?.getTextBeforeCursor(12 + skipSuffixLen, 0)?.toString() ?: return null
@@ -2115,7 +2075,6 @@ class ImeService : InputMethodService(),
         candidatePanel.visibility = if (overlay == Overlay.CANDIDATES) View.VISIBLE else View.GONE
         toolPanel.visibility = if (overlay == Overlay.TOOLS) View.VISIBLE else View.GONE
         clipboardPanel.visibility = if (overlay == Overlay.CLIPBOARD) View.VISIBLE else View.GONE
-        voicePanel.visibility = if (overlay == Overlay.VOICE) View.VISIBLE else View.GONE
         imagePanel.visibility = if (overlay == Overlay.IMAGES) View.VISIBLE else View.GONE
         resizeOverlay.visibility = if (overlay == Overlay.RESIZE) View.VISIBLE else View.GONE
 
@@ -2337,7 +2296,6 @@ class ImeService : InputMethodService(),
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
             aiWorker.execute { AiRanker.unload() }
             if (!handwritingMode) hwWorker.execute { HandwritingEngine.unload() }
-            if (overlay != Overlay.VOICE) OfflineAsrEngine.unload()
         }
     }
 

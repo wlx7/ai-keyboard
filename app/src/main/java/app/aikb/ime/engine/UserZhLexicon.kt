@@ -280,7 +280,7 @@ object UserZhLexicon {
     }
 
     /**
-     * Cross-engine learning: when the user commits a 2..6 char phrase via Handwriting or Voice
+     * Cross-engine learning: when the user commits a 2..6 char phrase via Handwriting
      * (e.g. handwrites `禁色`), index its Pinyin immediately so Pinyin typing knows it too!
      */
     @Synchronized
