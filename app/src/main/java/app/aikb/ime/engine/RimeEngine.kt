@@ -5,6 +5,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.Executors
 
 /**
@@ -97,6 +99,23 @@ object RimeEngine {
 
     const val PREF_FUZZY_ENABLED = "fuzzy_pinyin_enabled"
     const val PREF_FUZZY_PAIRS = "fuzzy_pinyin_pairs"
+    const val PREF_GRAMMAR_ENABLED = "octagram_enabled"
+    const val BUILTIN_GRAM_LANG = "keylo-zh-hans"
+    const val CUSTOM_GRAM_LANG = "wanxiang-custom"
+
+    fun customGramFile(context: Context): File =
+        File(context.filesDir, "rime/user/$CUSTOM_GRAM_LANG.gram")
+
+    fun isValidGramFile(file: File): Boolean {
+        if (!file.exists() || file.length() < 64L) return false
+        return runCatching {
+            val head = ByteArray(14)
+            file.inputStream().use { if (it.read(head) < 14) return false }
+            String(head, Charsets.US_ASCII) == "Rime::Grammar/"
+        }.getOrDefault(false)
+    }
+
+    fun hasCustomGram(context: Context): Boolean = isValidGramFile(customGramFile(context))
 
     fun activeFuzzyIds(context: Context): Set<String> {
         val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -109,7 +128,7 @@ object RimeEngine {
     val isReady: Boolean get() = state == State.READY
 
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "rime").apply { priority = Thread.NORM_PRIORITY - 1 } }
-    private val main = Handler(Looper.getMainLooper())
+    private val main by lazy { Handler(Looper.getMainLooper()) }
     private val listeners = mutableListOf<() -> Unit>()
     private var currentSchema: String? = null
     @Volatile private var pendingRedeploy = false
@@ -140,11 +159,20 @@ object RimeEngine {
                     val shared = File(root, "shared")
                     val user = File(root, "user").apply { mkdirs() }
                     val assetsChanged = syncAssets(app, shared)
-                    if (assetsChanged) File(user, "fuzzy_stamp.txt").delete()
+                    if (assetsChanged) {
+                        File(user, "fuzzy_stamp.txt").delete()
+                        File(user, "grammar_stamp.txt").delete()
+                    }
                     val fuzzyChanged = syncFuzzyAlgebra(shared, user, activeFuzzyIds(app))
+                    val grammarChanged = syncGrammarConfig(app, shared, user)
                     val logDir = if (app.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0)
                         File(app.cacheDir, "rime_log").apply { mkdirs() }.absolutePath else ""
-                    Rime.nativeStart(shared.absolutePath, user.absolutePath, logDir, assetsChanged || fuzzyChanged || forceRedeploy)
+                    Rime.nativeStart(
+                        shared.absolutePath,
+                        user.absolutePath,
+                        logDir,
+                        assetsChanged || fuzzyChanged || grammarChanged || forceRedeploy,
+                    )
                 }.onFailure { Log.e(TAG, "rime start failed", it) }.getOrDefault(false)
                 if (ok && targetSchema != null) Rime.nativeSelectSchema(targetSchema)
                 if (ok) applyOptions()
@@ -159,6 +187,87 @@ object RimeEngine {
     /** Triggers a background prism rebuild after Fuzzy Pinyin settings change. */
     fun redeployFuzzy(context: Context) {
         start(context, currentSchema, forceRedeploy = true)
+    }
+
+    /** Triggers a fast (<50 ms) schema-only redeploy when Octagram grammar settings or `.gram` change. */
+    fun redeployGrammar(context: Context) {
+        start(context, currentSchema, forceRedeploy = true)
+    }
+
+    /**
+     * Syncs built-in `keylo-zh-hans.gram` (without forcing a 25s dictionary table rebuild!) and
+     * wires Octagram (`collocation_max_length: 5` — immune to 32-byte UTF-8 stack overflow) into
+     * all Pinyin schemas. Automatically upgrades to user-imported `wanxiang-custom.gram` if present.
+     */
+    private fun syncGrammarConfig(context: Context, shared: File, user: File): Boolean {
+        shared.mkdirs()
+        val builtinAssetPath = "rime/$BUILTIN_GRAM_LANG.gram"
+        val builtinDst = File(shared, "$BUILTIN_GRAM_LANG.gram")
+        runCatching {
+            val expectedLen = runCatching { context.assets.openFd(builtinAssetPath).use { it.length } }.getOrDefault(-1L)
+            if (!builtinDst.exists() || (expectedLen > 0L && builtinDst.length() != expectedLen)) {
+                val tmp = File(builtinDst.path + ".tmp")
+                context.assets.open(builtinAssetPath).use { input ->
+                    tmp.outputStream().use { out -> input.copyTo(out, 1 shl 18) }
+                }
+                Files.move(tmp.toPath(), builtinDst.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        }
+
+        val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val enabled = prefs.getBoolean(PREF_GRAMMAR_ENABLED, true)
+        val customGram = File(user, "$CUSTOM_GRAM_LANG.gram")
+        val activeLang = when {
+            !enabled -> ""
+            isValidGramFile(customGram) -> CUSTOM_GRAM_LANG
+            isValidGramFile(builtinDst) -> BUILTIN_GRAM_LANG
+            else -> ""
+        }
+        val stampVal = "$activeLang:${if (activeLang == CUSTOM_GRAM_LANG) customGram.length() else builtinDst.length()}"
+        val stampFile = File(user, "grammar_stamp.txt")
+        if (stampFile.exists() && stampFile.readText().trim() == stampVal) return false
+
+        val transBlock = if (activeLang.isEmpty()) "" else buildString {
+            append("  # BEGIN_KEYLO_GRAMMAR_TRANS\n")
+            append("  contextual_suggestions: true\n")
+            append("  max_homophones: 7\n")
+            append("  max_homographs: 7\n")
+            append("  # END_KEYLO_GRAMMAR_TRANS\n")
+        }
+        val gramBlock = if (activeLang.isEmpty()) "" else buildString {
+            append("\n# BEGIN_KEYLO_GRAMMAR_BLOCK\n")
+            append("grammar:\n")
+            append("  language: ").append(activeLang).append('\n')
+            append("  collocation_max_length: 5\n")
+            append("  collocation_min_length: 2\n")
+            append("# END_KEYLO_GRAMMAR_BLOCK\n")
+        }
+
+        val buildDir = File(user, "build")
+        for (s in PINYIN_SCHEMA_FILES) {
+            val schemaFile = File(shared, "$s.schema.yaml")
+            if (!schemaFile.exists()) continue
+            var content = schemaFile.readText(Charsets.UTF_8)
+            content = content.replace(
+                Regex("(?ms)^  # BEGIN_KEYLO_GRAMMAR_TRANS\\n.*?^  # END_KEYLO_GRAMMAR_TRANS\\n"),
+                "",
+            )
+            content = content.replace(
+                Regex("(?ms)\\n?# BEGIN_KEYLO_GRAMMAR_BLOCK\\n.*?^# END_KEYLO_GRAMMAR_BLOCK\\n?"),
+                "",
+            )
+            if (transBlock.isNotEmpty()) {
+                content = content.replaceFirst("translator:\n", "translator:\n$transBlock")
+            }
+            if (gramBlock.isNotEmpty()) {
+                content = content.trimEnd() + "\n" + gramBlock
+            }
+            schemaFile.writeText(content, Charsets.UTF_8)
+            // Only remove compiled schema YAML (keep .table.bin & .prism.bin intact for <50ms instant deploy!)
+            File(buildDir, "$s.schema.yaml").delete()
+        }
+        stampFile.writeText(stampVal, Charsets.UTF_8)
+        return true
     }
 
     private fun syncFuzzyAlgebra(shared: File, user: File, enabledIds: Set<String>): Boolean {

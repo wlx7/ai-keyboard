@@ -14,5 +14,8 @@ local.properties
 /app/src/main/assets/asr/
 /app/src/embeddedAiAssets/
 /tools/distill/.venv/
+/tools/build_gram/ngrams.tsv
+/tools/build_gram/*.exe
+/tools/build_gram/*.obj
 __pycache__/
 *.pyc

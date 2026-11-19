@@ -350,12 +350,12 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v2.5 Flagship Offline", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v3.0 Hybrid Octagram + LLM", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "零网络权限 · 实时自造词与上下文学词 · Gboard 词库导入导出 · 233万词库 · 4万生僻字手写 · 内置端侧 AI 选句",
+                    "零网络权限 · 内置 Octagram 毫秒级语法词图（支持万象 .gram 导入）· Q8_0 端侧大模型 · 实时自造词学习",
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
                     color = Color.White.copy(alpha = 0.90f),
@@ -1900,14 +1900,52 @@ private fun PersonalDictionarySection(prefs: SharedPreferences) {
 private fun AiSection(prefs: SharedPreferences) {
     val context = LocalContext.current
     val userFile = remember { AiRanker.modelFile(context) }
+    val customGramFile = remember { RimeEngine.customGramFile(context) }
     val hasBuiltin = remember { AiRanker.hasBuiltinModel(context) }
     var userSize by remember { mutableStateOf(if (userFile.exists()) userFile.length() else 0L) }
+    var customGramSize by remember {
+        mutableStateOf(if (RimeEngine.isValidGramFile(customGramFile)) customGramFile.length() else 0L)
+    }
+    var gramOn by remember { mutableStateOf(prefs.getBoolean(RimeEngine.PREF_GRAMMAR_ENABLED, true)) }
     var aiOn by remember { mutableStateOf(prefs.getBoolean(ImeService.KEY_AI, true)) }
     var status by remember { mutableStateOf<String?>(null) }
 
+    val gramPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        status = "正在校验并导入语法模型（.gram）…"
+        Thread {
+            val result = runCatching {
+                customGramFile.parentFile?.mkdirs()
+                val tmp = File(customGramFile.path + ".part")
+                context.contentResolver.openInputStream(uri)!!.use { input ->
+                    val head = ByteArray(14)
+                    val stream = BufferedInputStream(input)
+                    stream.mark(32)
+                    val readN = stream.read(head)
+                    stream.reset()
+                    require(readN == 14 && String(head, Charsets.US_ASCII) == "Rime::Grammar/") {
+                        "不是有效的 Rime/万象 .gram 语法模型文件"
+                    }
+                    tmp.outputStream().use { stream.copyTo(it, 1 shl 20) }
+                }
+                Files.move(tmp.toPath(), customGramFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                customGramFile.length()
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                result.onSuccess { sz ->
+                    customGramSize = sz
+                    gramOn = true
+                    prefs.edit().putBoolean(RimeEngine.PREF_GRAMMAR_ENABLED, true).apply()
+                    RimeEngine.redeployGrammar(context)
+                    status = "外部万象语法模型已导入并激活（${sz / 1_000_000} MB）"
+                }.onFailure { status = "语法模型导入失败：${it.message}" }
+            }
+        }.start()
+    }
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
-        status = "正在导入外部模型…"
+        status = "正在导入外部大模型…"
         Thread {
             val result = runCatching {
                 AiRanker.resetAndUnload()
@@ -1924,34 +1962,80 @@ private fun AiSection(prefs: SharedPreferences) {
                 userFile.length()
             }
             android.os.Handler(android.os.Looper.getMainLooper()).post {
-                result.onSuccess { userSize = it; status = "外部模型已导入并激活" }
+                result.onSuccess { userSize = it; status = "外部 GGUF 大模型已导入并激活" }
                     .onFailure { status = "导入失败：${it.message}" }
             }
         }.start()
     }
 
-    SectionTitle("端侧 AI 智能选句（上下文同音消歧）")
+    SectionTitle("双擎智能核心（Octagram 毫秒级语法词图 + 端侧大模型）")
     CardBox {
-        SwitchItem("启用本地大模型优化选词与整句", "根据前文语境智能判别同音词（如「秋水 + shizhi → 时至」）", aiOn) {
+        SwitchItem(
+            "第一层：Octagram 0ms 词图语法模型",
+            "敲击瞬间实时优化词组搭配与成语整句（如 qiushuishizhi → 秋水时至）",
+            gramOn,
+        ) {
+            gramOn = it
+            prefs.edit().putBoolean(RimeEngine.PREF_GRAMMAR_ENABLED, it).apply()
+            RimeEngine.redeployGrammar(context)
+        }
+        RowDivider()
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("当前语法库", fontSize = 15.5.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+            val gramDesc = when {
+                !gramOn -> "已关闭"
+                customGramSize > 0 -> "外部万象模型 · ${customGramSize / 1_000_000} MB"
+                else -> "内置 Keylo-460K 语法库 · 已启用"
+            }
+            Text(gramDesc, fontSize = 14.sp, color = if (gramOn) Color(0xFF16A34A) else Secondary(), fontWeight = FontWeight.Medium)
+        }
+        RowDivider()
+        Row(
+            Modifier.fillMaxWidth().clickable { gramPicker.launch(arrayOf("*/*")) }.padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Column {
+                Text("导入外部万象语法模型（.gram）…", fontSize = 15.5.sp, color = MaterialTheme.colorScheme.primary)
+                Text("直接兼容 wanxiang-lts-zh-hans.gram，自动校验文件头防闪退", fontSize = 12.sp, color = Secondary())
+            }
+        }
+        if (customGramSize > 0) {
+            RowDivider()
+            Row(
+                Modifier.fillMaxWidth().clickable {
+                    customGramFile.delete()
+                    customGramSize = 0L
+                    RimeEngine.redeployGrammar(context)
+                    status = "已移除外部 .gram 并恢复内置 Keylo-460K 语法库"
+                }.padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text("移除外部 .gram 并恢复内置语法库", fontSize = 15.sp, color = Color(0xFFEF4444))
+            }
+        }
+        RowDivider()
+        SwitchItem(
+            "第二层：端侧大模型跨句语义选句",
+            "Q8_0 高精词嵌入 + 25 亿字频先验校准，精准理解跨句长上文且杜绝生僻字胡推",
+            aiOn,
+        ) {
             aiOn = it; prefs.edit().putBoolean(ImeService.KEY_AI, it).apply()
         }
         RowDivider()
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("当前模型", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+            Text("当前大模型", fontSize = 15.5.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
             val modelDesc = when {
                 userSize > 0 -> "自定义模型 · ${userSize / 1_000_000} MB"
-                hasBuiltin -> "内置旗舰 Keylo-285M · 已就绪"
+                hasBuiltin -> "内置旗舰 Keylo-285M v2 (Q8_0) · 已就绪"
                 else -> "未安装（请导入 .gguf）"
             }
-            Text(modelDesc, fontSize = 14.5.sp, color = if (userSize > 0 || hasBuiltin) Color(0xFF16A34A) else Secondary(), fontWeight = FontWeight.Medium)
+            Text(modelDesc, fontSize = 14.sp, color = if (userSize > 0 || hasBuiltin) Color(0xFF16A34A) else Secondary(), fontWeight = FontWeight.Medium)
         }
         RowDivider()
         Row(
             Modifier.fillMaxWidth().clickable { picker.launch(arrayOf("*/*")) }.padding(horizontal = 16.dp, vertical = 13.dp),
         ) {
             Text(
-                if (userSize > 0 || hasBuiltin) "导入其他自定义模型（.gguf）…" else "导入模型文件（.gguf）…",
-                fontSize = 16.sp,
+                if (userSize > 0 || hasBuiltin) "导入其他自定义大模型（.gguf）…" else "导入模型文件（.gguf）…",
+                fontSize = 15.5.sp,
                 color = MaterialTheme.colorScheme.primary,
             )
         }
@@ -1966,8 +2050,8 @@ private fun AiSection(prefs: SharedPreferences) {
                 }.padding(horizontal = 16.dp, vertical = 13.dp),
             ) {
                 Text(
-                    if (hasBuiltin) "移除外部模型并恢复内置 Keylo-285M" else "删除已导入模型",
-                    fontSize = 16.sp,
+                    if (hasBuiltin) "移除外部模型并恢复内置 Keylo-285M v2" else "删除已导入模型",
+                    fontSize = 15.5.sp,
                     color = Color(0xFFEF4444),
                 )
             }

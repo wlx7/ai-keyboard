@@ -173,8 +173,10 @@ JNI_FN(jfloatArray, nativeScore)(JNIEnv* env, jobject, jstring context, jobjectA
     if (!g_ctx) return nullptr;
     const int n = std::min<int>(env->GetArrayLength(candidates), kMaxSeq - 1);
     g_abort = false;
-    // A newline prefix guarantees at least one context token (Qwen adds no BOS).
-    std::vector<llama_token> ctxTok = tokenize("\n" + fromJava(env, context));
+    // When context is empty, anchor with "。\n" (clean Chinese sentence boundary) instead of bare "\n",
+    // eliminating Wikipedia/Baidu-Baike headword bias ("\n<RareWord>是指...") while preserving KV cache.
+    std::string rawCtx = fromJava(env, context);
+    std::vector<llama_token> ctxTok = tokenize(rawCtx.empty() ? "。\n" : ("\n" + rawCtx));
     if ((int) ctxTok.size() > kCtx - 64) ctxTok.erase(ctxTok.begin() + 1, ctxTok.end() - (kCtx - 64 - 1));
 
     std::vector<std::vector<llama_token>> cand(n);

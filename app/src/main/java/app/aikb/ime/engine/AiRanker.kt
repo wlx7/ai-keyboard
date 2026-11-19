@@ -19,19 +19,20 @@ import kotlin.math.ln
 object AiRanker {
     const val USER_MODEL_NAME = "zh-lm.gguf"
     const val BUILTIN_ASSET_PATH = "models/zh-lm-builtin.gguf"
-    const val BUILTIN_FILE_NAME = "zh-lm-builtin.gguf"
+    const val BUILTIN_ASSET_NAME = "zh-lm-builtin.gguf"
+    const val BUILTIN_EXTRACTED_NAME = "zh-lm-builtin-v3.gguf"
     private const val TAG = "AiRanker"
 
-    /** Default weight of librime's order, tuned on tools/eval (see ROADMAP.md). */
-    const val DEFAULT_ALPHA = 2.6f
+    /** Default weight of librime's order, tuned alongside Octagram lattice + Q8_0 lexical embeddings. */
+    const val DEFAULT_ALPHA = 2.2f
 
     /** The AI must beat librime's first choice by this many nats before overriding it. */
-    @Volatile var margin = 0.95f
+    @Volatile var margin = 0.90f
     const val MIN_SYLLABLES = 3
     const val MIN_CONTEXTUAL_SYLLABLES = 2
     private const val MIN_ALPHA = 1.2f
-    private const val MAX_ALPHA = 3.6f
-    private const val MAX_CANDIDATES = 20
+    private const val MAX_ALPHA = 3.4f
+    private const val MAX_CANDIDATES = 24
 
     @Volatile var alpha = DEFAULT_ALPHA
     @Volatile private var loaded = false
@@ -44,7 +45,7 @@ object AiRanker {
     fun modelFile(context: Context) = File(context.filesDir, "models/$USER_MODEL_NAME")
 
     /** Extracted built-in GGUF file for zero-copy mmap by llama.cpp. */
-    fun builtinExtractedFile(context: Context) = File(context.filesDir, "models/$BUILTIN_FILE_NAME")
+    fun builtinExtractedFile(context: Context) = File(context.filesDir, "models/$BUILTIN_EXTRACTED_NAME")
 
     fun hasUserModel(context: Context): Boolean =
         modelFile(context).let { it.exists() && it.length() > 1_000_000 }
@@ -52,7 +53,7 @@ object AiRanker {
     fun hasBuiltinModel(context: Context): Boolean {
         cachedHasAsset?.let { return it }
         val ok = runCatching {
-            context.assets.list("models")?.contains(BUILTIN_FILE_NAME) == true
+            context.assets.list("models")?.contains(BUILTIN_ASSET_NAME) == true
         }.getOrDefault(false) || builtinExtractedFile(context).let { it.exists() && it.length() > 1_000_000 }
         cachedHasAsset = ok
         return ok
@@ -65,6 +66,8 @@ object AiRanker {
         val user = modelFile(context)
         if (user.exists() && user.length() > 1_000_000) return user
         if (!hasBuiltinModel(context)) return null
+        // Clean up legacy v2 extracted file if present to save ~155 MB storage
+        runCatching { File(context.filesDir, "models/zh-lm-builtin.gguf").delete() }
         val dst = builtinExtractedFile(context)
         val expectedLen = runCatching {
             context.assets.openFd(BUILTIN_ASSET_PATH).use { it.length }
@@ -154,17 +157,72 @@ object AiRanker {
     /** Minimum total log-prob floor accounting for ~-11.5 first-token prior + -4.6 per continuation Hanzi. */
     private fun minLogProbFloor(charLen: Int): Float = -11.5f - 4.6f * (charLen - 1).coerceAtLeast(0)
 
+    /**
+     * Penalizes unprompted rare-character substitutions (e.g. `泅水是指` replacing `秋水是指`, where `泅` has
+     * 2.5B-corpus freq 1,283 vs `秋` 352,446) and encyclopedia definition templates when [context] is empty.
+     */
+    internal fun lexicalPriorPenalty(
+        defaultCand: String,
+        cand: String,
+        context: String = "",
+        useCache: Boolean = true,
+    ): Float {
+        if (cand == defaultCand || defaultCand.isEmpty()) return 0f
+        var penalty = 0f
+
+        // 1) Empty-context encyclopedia definition trap (`X是指` / `X即指` replacing default headword)
+        if (!hasCjkContext(context) && cand.length >= 4 &&
+            (cand.endsWith("是指") || cand.endsWith("即指") || cand.endsWith("简称")) &&
+            cand.substring(0, 2) != defaultCand.substring(0, minOf(2, defaultCand.length))
+        ) {
+            penalty += 4.2f
+        }
+
+        // 2) 2.5B-corpus character rarity guard (`8105.dict.yaml`)
+        if (HanziPinyin.isLoaded) {
+            val mem = if (useCache) sessionMemory() else ""
+            var iDef = 0
+            var iCand = 0
+            while (iDef < defaultCand.length && iCand < cand.length) {
+                val cpDef = defaultCand.codePointAt(iDef)
+                val cpCand = cand.codePointAt(iCand)
+                iDef += Character.charCount(cpDef)
+                iCand += Character.charCount(cpCand)
+                if (cpCand == cpDef) continue
+                val chStr = String(Character.toChars(cpCand))
+                if (chStr in context || (mem.isNotEmpty() && chStr in mem)) continue
+                val wDef = HanziPinyin.charWeight(cpDef)
+                val wCand = HanziPinyin.charWeight(cpCand)
+                if (wCand < 25_000 && wDef > wCand * 8) {
+                    penalty += (0.95f * ln(wDef.toFloat() / wCand.coerceAtLeast(20))).coerceAtMost(8.0f)
+                }
+            }
+        }
+        return penalty
+    }
+
     /** Index (into [candidates]) of the best candidate under [a]. */
-    fun best(s: Scored, candidates: List<String>, a: Float = alpha, useCache: Boolean = true, m: Float = margin): Int {
-        var best = s.indices[0]
+    fun best(
+        s: Scored,
+        candidates: List<String>,
+        a: Float = alpha,
+        useCache: Boolean = true,
+        m: Float = margin,
+        context: String = "",
+    ): Int {
+        val first = s.indices[0]
+        val defaultCand = candidates[first]
+        var best = first
         var bestRank = 0
         var bestScore = Float.NEGATIVE_INFINITY
         s.indices.forEachIndexed { rank, i ->
-            val score = s.lm[rank] - a * ln(1f + rank) + (if (useCache) cacheBoost(candidates[i]) else 0f)
+            val cand = candidates[i]
+            val score = s.lm[rank] - a * ln(1f + rank) +
+                (if (useCache) cacheBoost(cand) else 0f) -
+                lexicalPriorPenalty(defaultCand, cand, context, useCache)
             if (score > bestScore) { bestScore = score; best = i; bestRank = rank }
         }
-        val first = s.indices[0]
-        val firstScore = s.lm[0] + (if (useCache) cacheBoost(candidates[first]) else 0f)
+        val firstScore = s.lm[0] + (if (useCache) cacheBoost(defaultCand) else 0f)
         if (best != first) {
             val charLen = candidates[best].codePointCount(0, candidates[best].length).coerceAtLeast(1)
             if (bestScore - firstScore < m || s.lm[bestRank] < minLogProbFloor(charLen)) return first
@@ -202,7 +260,7 @@ object AiRanker {
         }
         val s = scoreRaw(context, alts, syllables)
         val effMargin = if (syllables == 2) 0.75f else margin
-        val top = s?.let { best(it, alts, m = effMargin) }
+        val top = s?.let { best(it, alts, m = effMargin, context = context) }
         Log.d(TAG, "suggest syl=$syllables alts=${alts.size} scored=${s?.indices?.size} changed=${s != null && top != s.indices[0]} " +
             "in ${android.os.SystemClock.elapsedRealtime() - t0} ms")
         if (s == null || top == null || top == s.indices[0]) return null
@@ -210,15 +268,18 @@ object AiRanker {
         // Also surface second-best distinct AI sentence only if strongly fluent and superior
         var second: String? = null
         var secondScore = Float.NEGATIVE_INFINITY
-        val firstScore = s.lm[0] + cacheBoost(alts[s.indices[0]])
+        val defCand = alts[s.indices[0]]
+        val firstScore = s.lm[0] + cacheBoost(defCand)
         s.indices.forEachIndexed { rank, idx ->
             if (idx == top || idx == s.indices[0]) return@forEachIndexed
-            val charLen = alts[idx].codePointCount(0, alts[idx].length).coerceAtLeast(1)
+            val cand = alts[idx]
+            val charLen = cand.codePointCount(0, cand.length).coerceAtLeast(1)
             if (s.lm[rank] < minLogProbFloor(charLen)) return@forEachIndexed
-            val sc = s.lm[rank] - alpha * ln(1f + rank) + cacheBoost(alts[idx])
+            val sc = s.lm[rank] - alpha * ln(1f + rank) + cacheBoost(cand) -
+                lexicalPriorPenalty(defCand, cand, context, useCache = true)
             if (sc > secondScore && sc - firstScore >= effMargin + 0.6f) {
                 secondScore = sc
-                second = alts[idx]
+                second = cand
             }
         }
         return Suggestion(alts[top], second, alts)

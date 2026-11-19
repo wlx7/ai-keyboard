@@ -19,6 +19,7 @@ import java.util.concurrent.Executors
 object HanziPinyin {
 
     private val table = ConcurrentHashMap<Int, Array<String>>(12_000)
+    private val weights = ConcurrentHashMap<Int, Int>(12_000)
     @Volatile var isLoaded = false
         private set
     private var loadingStarted = false
@@ -45,6 +46,7 @@ object HanziPinyin {
     /** Synchronous loader for unit tests or immediate fallback. */
     fun loadFromYamlStream(stream: InputStream, overwrite: Boolean = true) {
         val temp = HashMap<Int, MutableList<String>>(9_000)
+        val tempW = HashMap<Int, Int>(9_000)
         var inBody = false
         BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).forEachLine { raw ->
             val line = raw.trim()
@@ -61,20 +63,30 @@ object HanziPinyin {
             val t2 = rest.indexOf('\t')
             val py = (if (t2 >= 0) rest.substring(0, t2) else rest).trim().lowercase()
             if (py.isEmpty() || !py.all { it in 'a'..'z' }) return@forEachLine
+            val wt = if (t2 >= 0) rest.substring(t2 + 1).trim().substringBefore('\t').toIntOrNull() ?: 0 else 0
 
             val cp = word.codePointAt(0)
             val list = temp.getOrPut(cp) { ArrayList(2) }
             if (py !in list) list += py
+            if (wt > 0) tempW[cp] = (tempW[cp] ?: 0) + wt
         }
         for ((cp, list) in temp) {
             if (overwrite || !table.containsKey(cp)) {
                 table[cp] = list.toTypedArray()
             }
         }
+        for ((cp, wt) in tempW) {
+            if (overwrite || !weights.containsKey(cp)) {
+                weights[cp] = wt
+            }
+        }
         if (table.isNotEmpty()) isLoaded = true
     }
 
     fun readingsOf(codePoint: Int): Array<String>? = table[codePoint]
+
+    /** Returns 2.5B-corpus character frequency from `8105.dict.yaml` (defaults to 5 for unlisted rare Hanzi). */
+    fun charWeight(codePoint: Int): Int = weights[codePoint] ?: 5
 
     /** Returns primary concatenated Pinyin for [word] (e.g. `"禁色"` -> `"jinse"`), or null if unknown. */
     fun primaryPinyin(word: String): String? {

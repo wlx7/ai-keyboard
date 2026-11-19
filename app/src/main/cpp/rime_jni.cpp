@@ -476,10 +476,10 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
         size_t covered = 0;
         const size_t totalSyl = static_cast<size_t>(std::max<jint>(syllables, 0));
 
-        for (int step = 0; step < 6 && covered < totalSyl && !g_abortExplore && out.size() < 20; ++step) {
+        for (int step = 0; step < 6 && covered < totalSyl && !g_abortExplore && out.size() < 24; ++step) {
             const size_t rem = totalSyl - covered;
-            const int branchLimit = (step == 0) ? std::max<int>(firstK, 5) : 3;
-            const int directLimit = (rem <= 3) ? 12 : 6;
+            const int branchLimit = (step == 0) ? std::max<int>(firstK, 8) : 4;
+            const int directLimit = (rem <= 3) ? 14 : 8;
             auto cands = exploreCandidates(std::max(branchLimit * 3 + 4, directLimit + 4));
             if (cands.empty()) break;
 

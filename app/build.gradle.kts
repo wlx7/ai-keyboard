@@ -13,8 +13,8 @@ android {
         applicationId = "app.aikb.ime"
         minSdk = 26
         targetSdk = 35
-        versionCode = 14
-        versionName = "2.5.0"
+        versionCode = 15
+        versionName = "3.0.0"
         externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=c++_static") } }
     }
 
@@ -61,8 +61,8 @@ android {
     }
 
     androidResources {
-        // Dictionaries and GGUF models are read via mmap/stream; keep them uncompressed in the APK.
-        noCompress += listOf("bin", "dict", "gguf")
+        // Dictionaries, Octagram .gram, and GGUF models are read via mmap/stream; keep uncompressed.
+        noCompress += listOf("bin", "dict", "gguf", "gram")
     }
 }
 

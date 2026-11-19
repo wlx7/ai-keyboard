@@ -375,10 +375,29 @@ def build_training_sentences(
         return cjk >= 5 and cjk >= len(s) * 0.55
 
     if cache_file.exists():
-        cached = [ln.strip() for ln in cache_file.read_text(encoding="utf-8").splitlines() if is_clean(ln.strip())]
+        import re
+        wiki_def_re = re.compile(r"^[\u4e00-\u9fff]{1,5}(是指|即指|又称|简称|泛指)")
+        cached = [
+            ln.strip()
+            for ln in cache_file.read_text(encoding="utf-8").splitlines()
+            if is_clean(ln.strip()) and not wiki_def_re.match(ln.strip())
+        ]
+        # Enrich with classical poetry & literature clauses so idioms/poems keep sharp Teacher KL
+        lit_sources = [
+            Path("tools/data/dict-ext/THUOCL_poem.txt"),
+            Path("tools/data/dict-ext/frost_literature.dict.yaml"),
+        ]
+        lit_added = 0
+        for lp in lit_sources:
+            if lp.exists():
+                for raw in lp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    w = raw.strip().split()[0] if raw.strip() else ""
+                    if is_clean(w) and lit_added < 3500:
+                        cached.append(w)
+                        lit_added += 1
         if len(cached) >= min(10000, target_count):
             random.shuffle(cached)
-            print(f"[Corpus] Loaded {len(cached)} cached clean Chinese sentences from {cache_file} (0 eval overlap)")
+            print(f"[Corpus] Loaded {len(cached)} balanced Chinese sentences (incl. {lit_added} literary/poem, 0 wiki-def bias, 0 eval overlap)")
             return cached
 
     sents: List[str] = []
@@ -822,7 +841,8 @@ def main():
         for micro in range(args.grad_accum):
             batch_texts = []
             for _ in range(args.batch_size):
-                batch_texts.append("\n" + sentences[sent_idx % len(sentences)])
+                anchor = "。\n" if (sent_idx % 2 == 0) else "\n"
+                batch_texts.append(anchor + sentences[sent_idx % len(sentences)])
                 sent_idx += 1
 
             enc = student_tok(batch_texts, padding=True, truncation=True, max_length=56, return_tensors="pt")
@@ -858,7 +878,8 @@ def main():
                 kl2_loss = (kl_t2 * shift_mask).sum() / denom
                 kl1_loss = (kl_t1 * shift_mask).sum() / denom
 
-                loss = 0.10 * ce_loss + 0.50 * kl2_loss + 0.40 * kl1_loss
+                # Pure Teacher probability matching (0 noisy corpus CE) preserves 36T-token Qwen3 priors cleanly
+                loss = 0.55 * kl2_loss + 0.45 * kl1_loss
 
                 # Teacher-verified homophone log-odds margin calibration every 2nd step
                 if micro == 0 and step % 2 == 0:
