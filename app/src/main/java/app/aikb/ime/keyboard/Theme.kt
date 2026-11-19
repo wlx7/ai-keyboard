@@ -35,7 +35,7 @@ data class KbTheme(
         data class Preset(val id: String, val name: String, val swatchBg: Int, val swatchKey: Int, val swatchAccent: Int)
 
         val PRESETS = listOf(
-            Preset("system", "灵犀自适应", 0xFFECEFF4.toInt(), 0xFFFFFFFF.toInt(), 0xFF2563EB.toInt()),
+            Preset("system", "Keylo 自适应", 0xFFECEFF4.toInt(), 0xFFFFFFFF.toInt(), 0xFF2563EB.toInt()),
             Preset("pure_white", "凝脂纯白", 0xFFF3F5F9.toInt(), 0xFFFFFFFF.toInt(), 0xFF1677FF.toInt()),
             Preset("obsidian_dark", "曜石深黑", 0xFF121418.toInt(), 0xFF262A33.toInt(), 0xFF3B82F6.toInt()),
             Preset("morandi_blue", "莫兰迪雾蓝", 0xFFE3EAF2.toInt(), 0xFFFBFDFF.toInt(), 0xFF3A6EA5.toInt()),

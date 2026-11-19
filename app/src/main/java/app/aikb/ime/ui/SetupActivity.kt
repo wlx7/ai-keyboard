@@ -50,7 +50,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import app.aikb.ime.ImeService
 import app.aikb.ime.OtpNotificationService
 import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.ChinesePredictor
 import app.aikb.ime.engine.HandwritingEngine
+import app.aikb.ime.engine.PersonalDictionary
 import app.aikb.ime.engine.RecentImageStore
 import app.aikb.ime.engine.RimeEngine
 import app.aikb.ime.engine.UserHistory
@@ -186,6 +188,7 @@ class SetupActivity : ComponentActivity() {
                     KeyboardPrefs.KEY_SHOW_HINTS,
                     KeyboardPrefs.KEY_ENTER_TO_SEND,
                     KeyboardPrefs.KEY_OTP_AUTOFILL,
+                    KeyboardPrefs.KEY_CLIPBOARD_ENABLED,
                     -> {
                         if (previewMode == PreviewMode.HANDWRITING) previewMode = PreviewMode.KEYBOARD
                         previewExpanded = true
@@ -229,11 +232,11 @@ class SetupActivity : ComponentActivity() {
                 if (!enabled || !selected) {
                     SectionTitle("快速启用")
                     CardBox {
-                        StepRow(1, "在系统设置中启用灵犀输入法", done = enabled) {
+                        StepRow(1, "在系统设置中启用 Keylo", done = enabled) {
                             startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
                         }
                         RowDivider()
-                        StepRow(2, "切换为当前默认输入法", done = selected, enabledRow = enabled) {
+                        StepRow(2, "切换 Keylo 为当前默认输入法", done = selected, enabledRow = enabled) {
                             (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
                         }
                     }
@@ -274,6 +277,9 @@ class SetupActivity : ComponentActivity() {
 
                 Spacer(Modifier.height(22.dp))
                 ChineseSchemaSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                PersonalDictionarySection(prefs)
 
                 Spacer(Modifier.height(22.dp))
                 AiSection(prefs)
@@ -321,7 +327,7 @@ class SetupActivity : ComponentActivity() {
         ) {
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("灵犀输入法", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Keylo", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Spacer(Modifier.width(10.dp))
                     Box(
                         Modifier
@@ -329,12 +335,12 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v2.1 旗舰离线版", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v2.2 Flagship Offline", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "零网络权限 · 所见即所得实时调参预览 · 微信键盘辅助输入全对齐 · 233万词库 · 4万生僻字手写 · 内置AI选句",
+                    "零网络权限 · 实时调参预览 · Gboard 词库导入导出 · 233万词库 · 4万生僻字手写 · 内置端侧 AI 选句",
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
                     color = Color.White.copy(alpha = 0.90f),
@@ -630,6 +636,7 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         previewOverlay.theme = t
 
         candidateBar.prefs = prefs
+        candidateBar.showClipboardIcon = prefs.clipboardEnabled
         keyboardView.prefs = prefs
         handwritingView.prefs = prefs
         t9View.prefs = prefs
@@ -641,12 +648,19 @@ private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
         t9View.visibility = if (mode == PreviewMode.T9) View.VISIBLE else View.GONE
 
         val showOtpSample = lastChangedKey == KeyboardPrefs.KEY_OTP_AUTOFILL && prefs.otpAutoFill && mode != PreviewMode.HANDWRITING
+        val showToolbarSample = lastChangedKey == KeyboardPrefs.KEY_CLIPBOARD_ENABLED && mode != PreviewMode.HANDWRITING
         when {
             showOtpSample -> {
                 preeditBar.text = ""
                 candidateBar.expandable = false
                 candidateBar.freshOtpCode = "2046"
                 candidateBar.freshOtpSource = "信息"
+                candidateBar.setItems(emptyList(), -1)
+            }
+            showToolbarSample -> {
+                preeditBar.text = ""
+                candidateBar.expandable = false
+                candidateBar.freshOtpCode = null
                 candidateBar.setItems(emptyList(), -1)
             }
             mode == PreviewMode.HANDWRITING -> {
@@ -890,6 +904,7 @@ private fun AuxiliaryInputSection(
     var spaceCnNum by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SPACE_CN_NUM, false)) }
     var spaceCnEn by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SPACE_CN_EN, false)) }
     var otpAutoFill by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_OTP_AUTOFILL, true)) }
+    var clipboardOn by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_CLIPBOARD_ENABLED, true)) }
     var autoCaps by remember { mutableStateOf(prefs.getBoolean("auto_caps", true)) }
     var doubleSpace by remember { mutableStateOf(prefs.getBoolean("double_space", true)) }
     var smartZh by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SMART_PINYIN_CORRECT, true)) }
@@ -973,6 +988,14 @@ private fun AuxiliaryInputSection(
                     fontWeight = FontWeight.SemiBold,
                 )
             }
+        }
+        RowDivider()
+        SwitchItem(
+            title = "剪贴板历史与快捷粘贴",
+            subtitle = "关闭后不再监听系统剪贴板、隐藏顶栏剪贴板入口并清空暂存记录",
+            checked = clipboardOn,
+        ) {
+            clipboardOn = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_CLIPBOARD_ENABLED, it).apply()
         }
         RowDivider()
         SwitchItem(
@@ -1240,6 +1263,216 @@ private fun ChineseSchemaSection(prefs: SharedPreferences) {
 }
 
 @Composable
+private fun PersonalDictionarySection(prefs: SharedPreferences) {
+    val context = LocalContext.current
+    val dictFile = remember { context.filesDir.resolve("personal_dict.tsv") }
+    var entries by remember { mutableStateOf(PersonalDictionary.allEntries(context)) }
+    var enCount by remember { mutableStateOf(UserHistory(context.filesDir.resolve("en_user.tsv")).totalWordCount()) }
+    var showAddForm by remember { mutableStateOf(false) }
+    var showAllEntries by remember { mutableStateOf(false) }
+    var shortcutInput by remember { mutableStateOf("") }
+    var wordInput by remember { mutableStateOf("") }
+    var statusMsg by remember { mutableStateOf<String?>(null) }
+
+    fun notifyImeReload() {
+        entries = PersonalDictionary.allEntries(context)
+        enCount = UserHistory(context.filesDir.resolve("en_user.tsv")).totalWordCount()
+        prefs.edit().putLong("reload_user_lexicon", System.currentTimeMillis()).apply()
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        statusMsg = "正在导入词库文件…"
+        Thread {
+            val res = runCatching {
+                val enHist = UserHistory(context.filesDir.resolve("en_user.tsv"))
+                val zhPred = runCatching {
+                    ChinesePredictor.load(context, context.filesDir.resolve("zh_user.tsv"))
+                }.getOrNull()
+                context.contentResolver.openInputStream(uri)!!.use { stream ->
+                    PersonalDictionary.importFromStream(dictFile, stream, enHist, zhPred)
+                }
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                res.onSuccess { summary ->
+                    notifyImeReload()
+                    statusMsg = "导入成功：新增自定义词条 ${summary.importedCustom} 条、英文词频 ${summary.importedEnglishWords} 条、中文联想 ${summary.importedChineseBigrams} 组"
+                }.onFailure {
+                    statusMsg = "导入失败：${it.message}"
+                }
+            }
+        }.start()
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        statusMsg = "正在打包导出 Gboard 兼容词库…"
+        Thread {
+            val res = runCatching {
+                val enHist = UserHistory(context.filesDir.resolve("en_user.tsv"))
+                val zhPred = runCatching {
+                    ChinesePredictor.load(context, context.filesDir.resolve("zh_user.tsv"))
+                }.getOrNull()
+                val rimeWords = RimeEngine.exportSyncedUserWords(context)
+                context.contentResolver.openOutputStream(uri)!!.use { out ->
+                    PersonalDictionary.exportGboardZip(dictFile, out, enHist, zhPred, rimeWords)
+                }
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                res.onSuccess { total ->
+                    statusMsg = "导出完成：共备份 $total 条个人词条（标准 Gboard .zip 格式，可双向导入）"
+                }.onFailure {
+                    statusMsg = "导出失败：${it.message}"
+                }
+            }
+        }.start()
+    }
+
+    SectionTitle("个人词典与词库导入导出（兼容 Gboard）")
+    CardBox {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("本地个人词库概览", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface)
+                Text(
+                    "自定义快捷短语 ${entries.size} 条 · 已学习英文个人词条 $enCount 条（纯本地存储）",
+                    fontSize = 12.sp,
+                    color = Secondary(),
+                )
+            }
+        }
+        RowDivider()
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable { showAddForm = !showAddForm }
+                .padding(horizontal = 16.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                if (showAddForm) "收起添加面板 ▲" else "+ 添加自定义词条 / 快捷短语",
+                fontSize = 16.sp,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        if (showAddForm) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                OutlinedTextField(
+                    value = shortcutInput,
+                    onValueChange = { shortcutInput = it },
+                    label = { Text("快捷码 / 拼音（选填，如 dz、eml、weilele）", fontSize = 13.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = wordInput,
+                    onValueChange = { wordInput = it },
+                    label = { Text("要输出的词条、专有名词或长短语", fontSize = 13.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(
+                        onClick = {
+                            if (PersonalDictionary.addOrUpdate(context, shortcutInput, wordInput)) {
+                                shortcutInput = ""
+                                wordInput = ""
+                                showAddForm = false
+                                notifyImeReload()
+                                statusMsg = "已保存到个人词典 ✓"
+                            }
+                        },
+                        enabled = wordInput.isNotBlank(),
+                    ) {
+                        Text("保存词条")
+                    }
+                    TextButton(onClick = { showAddForm = false }) {
+                        Text("取消")
+                    }
+                }
+            }
+        }
+        if (entries.isNotEmpty()) {
+            RowDivider()
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { showAllEntries = !showAllEntries }
+                    .padding(horizontal = 16.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("管理已添加的自定义词条（${entries.size}）", fontSize = 14.5.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                Text(if (showAllEntries) "收起 ▲" else "查看 ▼", fontSize = 13.sp, color = Secondary())
+            }
+            if (showAllEntries) {
+                entries.take(30).forEach { item ->
+                    RowDivider()
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(item.word, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface)
+                            if (item.shortcut.isNotEmpty()) {
+                                Text("快捷码: ${item.shortcut}  ·  ${item.locale}", fontSize = 12.sp, color = Secondary())
+                            }
+                        }
+                        Text(
+                            "删除",
+                            fontSize = 13.5.sp,
+                            color = Color(0xFFEF4444),
+                            modifier = Modifier
+                                .clickable {
+                                    PersonalDictionary.remove(context, item)
+                                    notifyImeReload()
+                                }
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                    }
+                }
+            }
+        }
+        RowDivider()
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable { importLauncher.launch(arrayOf("*/*")) }
+                .padding(horizontal = 16.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("导入个人词库（Gboard .zip / txt / Rime 词表）…", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
+                Text("直接兼容 Gboard 导出的 PersonalDictionary.zip 及纯文本词库", fontSize = 12.sp, color = Secondary())
+            }
+        }
+        RowDivider()
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable { exportLauncher.launch("Keylo-PersonalDictionary.zip") }
+                .padding(horizontal = 16.dp, vertical = 13.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("导出个人词库备份（Gboard 兼容 .zip）…", fontSize = 16.sp, color = MaterialTheme.colorScheme.primary)
+                Text("一键打包自定义短语与中英文已学习词条，可导入 Gboard 或新手机", fontSize = 12.sp, color = Secondary())
+            }
+        }
+    }
+    if (statusMsg != null) {
+        Text(statusMsg!!, fontSize = 13.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(start = 14.dp, top = 6.dp, end = 14.dp))
+    }
+}
+
+@Composable
 private fun AiSection(prefs: SharedPreferences) {
     val context = LocalContext.current
     val userFile = remember { AiRanker.modelFile(context) }
@@ -1283,7 +1516,7 @@ private fun AiSection(prefs: SharedPreferences) {
             Text("当前模型", fontSize = 16.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
             val modelDesc = when {
                 userSize > 0 -> "自定义模型 · ${userSize / 1_000_000} MB"
-                hasBuiltin -> "内置旗舰 Lingxi-285M · 已就绪"
+                hasBuiltin -> "内置旗舰 Keylo-285M · 已就绪"
                 else -> "未安装（请导入 .gguf）"
             }
             Text(modelDesc, fontSize = 14.5.sp, color = if (userSize > 0 || hasBuiltin) Color(0xFF16A34A) else Secondary(), fontWeight = FontWeight.Medium)
@@ -1309,7 +1542,7 @@ private fun AiSection(prefs: SharedPreferences) {
                 }.padding(horizontal = 16.dp, vertical = 13.dp),
             ) {
                 Text(
-                    if (hasBuiltin) "移除外部模型并恢复内置 Lingxi-285M" else "删除已导入模型",
+                    if (hasBuiltin) "移除外部模型并恢复内置 Keylo-285M" else "删除已导入模型",
                     fontSize = 16.sp,
                     color = Color(0xFFEF4444),
                 )
@@ -1382,7 +1615,7 @@ private fun PrivacySection(prefs: SharedPreferences) {
         }
     }
     Text(
-        "灵犀输入法在 AndroidManifest 中未声明 INTERNET 网络权限，操作系统内核层面阻断一切联网可能。您的所有输入、语音、手写、验证码提取、剪贴板与图片均 100% 留在手机本地。",
+        "Keylo 在 AndroidManifest 中未声明 INTERNET 网络权限，操作系统内核层面阻断一切联网可能。您的所有输入、语音、手写、个人词典、验证码提取、剪贴板与图片均 100% 留在手机本地。",
         fontSize = 12.5.sp,
         lineHeight = 18.sp,
         color = Secondary(),

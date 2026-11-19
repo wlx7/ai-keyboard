@@ -107,7 +107,8 @@ class EnglishEngine(private val dict: EnglishDictionary, private val history: Us
         for (i in dict.exactRange(key)) {
             val d = dict.display(i)
             val base = dict.freq(i) + 30.0 + boost(d)
-            offer(d, base, false)
+            val isBuiltInTypo = d.lowercase().filter { it in 'a'..'z' } != key
+            offer(d, base, isBuiltInTypo)
             if (matchCase(typed, d) == typed) {
                 literalScore = maxOf(literalScore, base + (ctxBoost[d.lowercase()] ?: 0.0))
                 literalFreq = maxOf(literalFreq, dict.freq(i))
@@ -216,9 +217,14 @@ class EnglishEngine(private val dict: EnglishDictionary, private val history: Us
         // same-letter fixes (dont -> don't, im -> I'm, monday -> Monday, think its -> think it's) still apply to it.
         val top = ranked.firstOrNull()
         val sameLetters = top != null && top.text.lowercase().filter { it in 'a'..'z' } == key
-        val auto = if (top != null && !top.text.equals(typed, ignoreCase = false) &&
-            top.score >= 95.0 && top.score >= literalScore + 40.0 && key.length >= 2 &&
-            (sameLetters || literalFreq < 75)
+        val hasIntentionalInnerCaps = typed.length >= 2 && typed.drop(1).any { it.isUpperCase() } && !typed.all { it.isUpperCase() }
+        val auto = if (top != null && !top.text.equals(typed, ignoreCase = false) && !hasIntentionalInnerCaps &&
+            (sameLetters || top.isCorrection) &&
+            (
+                (sameLetters && top.score >= 95.0 && top.score >= literalScore + 38.0 && key.length >= 2) ||
+                (key in commonMisspellings) ||
+                (!sameLetters && key.length >= 3 && top.score >= 110.0 && top.score >= literalScore + 44.0 && literalFreq < 70)
+            )
         ) top.text else null
 
         return EnglishResult(typed, ranked, auto)

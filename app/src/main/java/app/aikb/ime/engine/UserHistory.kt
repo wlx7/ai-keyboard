@@ -37,6 +37,21 @@ class UserHistory(private val file: File) {
 
     @Synchronized fun count(word: String): Int = counts[word] ?: 0
 
+    @Synchronized fun totalWordCount(): Int = counts.size
+
+    @Synchronized fun allWords(): List<Pair<String, Int>> =
+        counts.entries.sortedByDescending { it.value }.map { it.key to it.value }
+
+    @Synchronized fun importWord(word: String, minCount: Int = 3) {
+        val w = word.trim().lowercase()
+        if (w.length !in 2..40 || ' ' in w) return
+        val next = maxOf(counts[w] ?: 0, minCount)
+        if (counts[w] != next) {
+            counts[w] = next
+            dirty = true
+        }
+    }
+
     @Synchronized fun add(word: String, prevWord: String? = null) {
         counts[word] = (counts[word] ?: 0) + 1
         dirty = true

@@ -91,16 +91,28 @@ object Layouts {
         else Key(KeyType.TO_LETTERS, if (chinese) (spaceLabel ?: "拼音") else "ABC", width = 1.28f)
         val emoji = Key(KeyType.EMOJI, "emoji", width = 1.12f)
         val enter = Key(KeyType.ENTER, "", width = if (kind == BottomRow.TEXT) 1.75f else 2.0f)
-        if (kind == BottomRow.TEXT && chinese && page == Page.LETTERS) {
-            return Row(listOf(
-                Key(KeyType.TO_SYMBOLS, "123", width = 1.15f),
-                Key(KeyType.EMOJI, "emoji", width = 1.05f),
-                Key(KeyType.CHAR, "，", "，", 0.9f, listOf("、", "；", "：", ",")),
-                Key(KeyType.SPACE, spaceLabel ?: "空格", " ", 3.15f),
-                Key(KeyType.CHAR, "。", "。", 0.9f, listOf("？", "！", "…", ".")),
-                Key(KeyType.LANG, "中/英", width = 1.2f),
-                Key(KeyType.ENTER, "", width = 1.65f),
-            ))
+        if (kind == BottomRow.TEXT && page == Page.LETTERS) {
+            return if (chinese) {
+                Row(listOf(
+                    Key(KeyType.TO_SYMBOLS, "123", width = 1.15f),
+                    Key(KeyType.EMOJI, "emoji", width = 1.05f),
+                    Key(KeyType.CHAR, "，", "，", 0.9f, listOf("、", "；", "：", ",")),
+                    Key(KeyType.SPACE, spaceLabel ?: "空格", " ", 3.15f),
+                    Key(KeyType.CHAR, "。", "。", 0.9f, listOf("？", "！", "…", ".")),
+                    Key(KeyType.LANG, "中/英", width = 1.2f),
+                    Key(KeyType.ENTER, "", width = 1.65f),
+                ))
+            } else {
+                Row(listOf(
+                    Key(KeyType.TO_SYMBOLS, "123", width = 1.15f),
+                    Key(KeyType.EMOJI, "emoji", width = 1.05f),
+                    Key(KeyType.CHAR, ",", ",", 0.9f, listOf(";", ":", "'", "\"")),
+                    Key(KeyType.SPACE, "space", " ", 3.15f),
+                    Key(KeyType.CHAR, ".", ".", 0.9f, listOf("?", "!", "…", "/")),
+                    Key(KeyType.LANG, "中/英", width = 1.2f),
+                    Key(KeyType.ENTER, "", width = 1.65f),
+                ))
+            }
         }
         return when (kind) {
             BottomRow.TEXT -> Row(listOf(

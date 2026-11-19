@@ -268,5 +268,33 @@ object RimeEngine {
 
     fun setOption(name: String, value: Boolean) { if (isReady) Rime.nativeSetOption(name, value) }
 
+    /** Flushes Rime's binary userdb to plain-text `.userdb.txt` under `files/rime/user/sync` and harvests learned entries. */
+    fun exportSyncedUserWords(context: Context): List<Pair<String, String>> {
+        if (isReady) runCatching { Rime.nativeSyncUserData() }
+        val syncRoot = File(context.filesDir, "rime/user/sync")
+        if (!syncRoot.exists()) return emptyList()
+        val out = ArrayList<Pair<String, String>>()
+        runCatching {
+            syncRoot.walkTopDown()
+                .filter { it.isFile && it.name.endsWith(".userdb.txt") }
+                .forEach { f ->
+                    f.forEachLine(Charsets.UTF_8) { line ->
+                        if (line.isBlank() || line.startsWith("#")) return@forEachLine
+                        val parts = line.split('\t')
+                        if (parts.size >= 2) {
+                            val py = parts[0].trim().filter { it in 'a'..'z' }
+                            val word = parts[1].trim()
+                            val meta = parts.getOrNull(2).orEmpty()
+                            // Skip deleted entries (c <= 0)
+                            if (word.isNotEmpty() && !meta.contains("c=0") && !meta.contains("c=-")) {
+                                out += py to word
+                            }
+                        }
+                    }
+                }
+        }
+        return out
+    }
+
     private const val TAG = "RimeEngine"
 }

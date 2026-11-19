@@ -39,9 +39,12 @@ class EnglishEngineTest {
         assertEquals("January", engine.suggest("january").autoCorrect)
     }
 
-    @Test fun completes() {
+    @Test fun completesWithoutForcedAutoReplace() {
         val s = engine.suggest("beau").suggestions.map { it.text }
         assertTrue(s.toString(), "beautiful" in s)
+        // Prefix completions and mixed-case brand names must never hijack spacebar commit
+        assertNull(engine.suggest("keyl").autoCorrect)
+        assertNull(engine.suggest("Keylo").autoCorrect)
     }
 
     @Test fun predictsNextWord() {

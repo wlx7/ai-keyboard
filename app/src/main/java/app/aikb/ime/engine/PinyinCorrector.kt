@@ -5,11 +5,13 @@ import kotlin.math.hypot
 /**
  * Offline QWERTY spatial + structural Pinyin typo corrector (`中文智能纠错`).
  *
- * Detects and repairs common mobile typing mistakes in <0.4 ms:
- *   1. Adjacent-key fat-finger substitutions (`nihso -> nihao`, `shebme -> shenme`, `xianxai -> xianzai`, `xiansai -> xianzai`)
- *   2. Fast-typing letter transpositions (`zhognguo -> zhongguo`, `womne -> women`, `mingtina -> mingtian`)
- *   3. Accidental double-taps (`niihao -> nihao`, `xiexiee -> xiexie`)
- *   4. Dropped finals / medials (`zhng -> zhong/zhang`, `shnme -> shenme`)
+ *Conservative & non-intrusive by design:
+ *   - NEVER injects guesses when the user's input already forms valid Pinyin syllables covered
+ *     by an exact multi-character Rime word (e.g. `bu dong` -> `不懂 | 不动` stays 100% pure!).
+ *   - NEVER triggers prematurely when the user is mid-way through typing a trailing initial
+ *     (e.g. `jin ri ch` on the way to `jin ri chi fan`).
+ *   - Repairs genuine broken Pinyin (`nihso -> 你好`, `shebme -> 什么`, `zhognguo -> 中国`, `womne -> 我们`)
+ *     and rare valid-syllable non-words (`xiansai -> 现在`) where Rime has no full-span lexical entry.
  */
 object PinyinCorrector {
 
@@ -29,12 +31,19 @@ object PinyinCorrector {
             for ((other, p2) in KEY_POS) {
                 if (other == ch) continue
                 val d = hypot(p1.first - p2.first, p1.second - p2.second)
-                if (d <= 1.52f) list += other to d
+                if (d <= 1.48f) list += other to d
             }
             list.sortBy { it.second }
             put(ch, list)
         }
     }
+
+    private val INITIALS: Set<String> = setOf(
+        "zh", "ch", "sh",
+        "b", "p", "m", "f", "d", "t", "n", "l",
+        "g", "k", "h", "j", "q", "x",
+        "r", "z", "c", "s", "y", "w",
+    )
 
     private val VALID_SYLLABLES: Set<String> = setOf(
         "a", "ai", "an", "ang", "ao",
@@ -76,6 +85,33 @@ object PinyinCorrector {
         "zhuo", "zi", "zong", "zou", "zu", "zuan", "zui", "zun", "zuo",
     )
 
+    /** True iff every space/apostrophe-delimited syllable in [spelled] is a complete Mandarin syllable. */
+    fun allCompleteSyllables(spelled: String): Boolean {
+        val parts = spelled.lowercase().split(' ', '\'').filter { it.isNotBlank() }
+        return parts.isNotEmpty() && parts.all { it in VALID_SYLLABLES }
+    }
+
+    /**
+     * True when [rawInput] is simply complete valid syllable(s) followed by an unfinished trailing
+     * initial consonant (`jinrich` = `jin` + `ri` + `ch`, `bud` = `bu` + `d`).
+     */
+    fun isMidTypingInitial(rawInput: String): Boolean {
+        if (rawInput in INITIALS) return true
+        if (rawInput.length >= 3) {
+            val tail2 = rawInput.takeLast(2)
+            if (tail2 in setOf("zh", "ch", "sh") && minCompleteSyllables(rawInput.dropLast(2)) > 0) {
+                return true
+            }
+        }
+        if (rawInput.length >= 2) {
+            val tail1 = rawInput.takeLast(1)
+            if (tail1 in INITIALS && minCompleteSyllables(rawInput.dropLast(1)) > 0) {
+                return true
+            }
+        }
+        return false
+    }
+
     /**
      * Returns the minimum number of complete Mandarin syllables covering [s], or -1 if [s] cannot
      * be segmented into valid complete syllables without leftover consonants/fragments.
@@ -105,7 +141,8 @@ object PinyinCorrector {
      */
     fun suggestPinyinFixes(rawInput: String, maxFixes: Int = 6): List<Fix> {
         val clean = rawInput.filter { it in 'a'..'z' }
-        if (clean.length !in 3..22 || clean != rawInput) return emptyList()
+        if (clean.length !in 4..20 || clean != rawInput) return emptyList()
+        if (isMidTypingInitial(clean)) return emptyList()
 
         val origSyl = minCompleteSyllables(clean)
         val isBroken = origSyl < 0
@@ -115,7 +152,6 @@ object PinyinCorrector {
             if (cand == clean) return
             val syl = minCompleteSyllables(cand)
             if (syl <= 0) return
-            // Avoid turning a 4-letter typo into 4 single-vowel syllables ("aaaa")
             if (cand.length >= 4 && syl >= cand.length) return
             if (!isBroken && syl > origSyl) return
             val totalPenalty = editCost + syl * 0.35f
@@ -124,7 +160,7 @@ object PinyinCorrector {
         }
 
         // 1. Adjacent-key substitution (e.g. nihso -> nihao, shebme -> shenme, xiansai -> xianzai)
-        val maxDist = if (isBroken) 1.50f else 1.22f
+        val maxDist = if (isBroken) 1.45f else 1.18f
         val chars = clean.toCharArray()
         for (i in chars.indices) {
             val orig = chars[i]
@@ -173,30 +209,44 @@ object PinyinCorrector {
     }
 
     /**
-     * Queries Rime's hidden session to convert typo-repaired Pinyin into real Chinese phrase candidates.
-     * Safe to call on UI or worker thread when Rime is ready (<0.5 ms per candidate).
+     * Queries Rime's hidden session to convert typo-repaired Pinyin into real Chinese phrase candidates,
+     * ONLY when the user's original input is genuinely broken (`origSyl < 0`) OR lacks any full-span
+     * lexical match in Rime (`rimeFirstLen < origSyl`).
      */
-    fun resolveCandidates(schema: String, rawInput: String, existingCandidates: List<String>): List<String> {
-        if (schema != "rime_ice") return emptyList()
-        val fixes = suggestPinyinFixes(rawInput, maxFixes = 5)
+    fun resolveCandidates(
+        schema: String,
+        rawInput: String,
+        rimeTopText: String?,
+        existingCandidates: List<String>,
+    ): List<String> {
+        if (schema != "rime_ice" || rawInput.length < 4) return emptyList()
+        if (isMidTypingInitial(rawInput)) return emptyList()
+
+        val origSyl = minCompleteSyllables(rawInput)
+        val rimeFirstLen = rimeTopText?.codePointCount(0, rimeTopText.length) ?: 0
+
+        // Crucial non-intrusive guard: if rawInput is valid Pinyin AND Rime already matched a full-word
+        // phrase (e.g. "budong" -> "不懂", 2 >= 2), NEVER inject neighbor-key guesses ("不送", "怒动")!
+        if (origSyl > 0 && rimeFirstLen >= origSyl) return emptyList()
+        if (origSyl > 0 && rawInput.length < 6) return emptyList()
+
+        val fixes = suggestPinyinFixes(rawInput, maxFixes = 4)
         if (fixes.isEmpty()) return emptyList()
 
+        val maxResults = if (origSyl < 0) 2 else 1
         val existingSet = existingCandidates.toHashSet()
-        val results = ArrayList<String>(3)
+        val results = ArrayList<String>(maxResults)
         for (fix in fixes) {
             val expSyl = minCompleteSyllables(fix.correctedPinyin)
-            val top = RimeEngine.queryTop(schema, fix.correctedPinyin, maxCands = 3)
+            val top = RimeEngine.queryTop(schema, fix.correctedPinyin, maxCands = 2)
             for (cand in top) {
                 if (cand.isEmpty() || cand in existingSet || cand in results) continue
-                // If original input was already valid syllables (e.g. xiansai), only accept whole-word lexical hits!
                 val cpLen = cand.codePointCount(0, cand.length)
-                if (!fix.brokenOriginal && cpLen < expSyl) continue
-                if (cpLen >= 2) {
-                    results += cand
-                    break
-                }
+                if (cpLen < expSyl || cpLen < 2) continue
+                results += cand
+                break
             }
-            if (results.size >= 2) break
+            if (results.size >= maxResults) break
         }
         return results
     }

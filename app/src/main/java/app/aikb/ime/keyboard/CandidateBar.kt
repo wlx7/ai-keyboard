@@ -59,6 +59,9 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     var hasClips = false
         set(v) { if (field != v) { field = v; invalidate() } }
 
+    var showClipboardIcon = true
+        set(v) { if (field != v) { field = v; invalidate() } }
+
     var freshClip: String? = null
         set(v) { if (field != v) { field = v; invalidate() } }
 
@@ -154,8 +157,13 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
     private fun updateToolbarRects(w: Float, h: Float) {
         menuRect.set(4 * dp, 4 * dp, 44 * dp, h - 4 * dp)
         hwRect.set(48 * dp, 5.5f * dp, 112 * dp, h - 5.5f * dp)
-        clipRect.set(116 * dp, 4 * dp, 156 * dp, h - 4 * dp)
-        imgRect.set(158 * dp, 4 * dp, 198 * dp, h - 4 * dp)
+        if (showClipboardIcon) {
+            clipRect.set(116 * dp, 4 * dp, 156 * dp, h - 4 * dp)
+            imgRect.set(158 * dp, 4 * dp, 198 * dp, h - 4 * dp)
+        } else {
+            clipRect.setEmpty()
+            imgRect.set(116 * dp, 4 * dp, 156 * dp, h - 4 * dp)
+        }
         hideRect.set(w - 44 * dp, 4 * dp, w - 4 * dp, h - 4 * dp)
         voiceRect.set(w - 86 * dp, 4 * dp, w - 46 * dp, h - 4 * dp)
     }
@@ -369,15 +377,17 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
             val fm = paint.fontMetrics
             c.drawText(if (handwritingActive) "键盘" else "手写", hwRect.left + 41 * dp, cy - (fm.ascent + fm.descent) / 2f, paint)
 
-            // `[📋]` Clipboard icon
-            if (pressedToolbar == ToolbarAction.CLIPBOARD) {
-                fill.color = theme.keyPressed
-                c.drawRoundRect(clipRect, 9 * dp, 9 * dp, fill)
-            }
-            KeyDraw.drawClipboardIcon(c, clipRect.centerX(), cy, 18.5f * dp, theme.text, stroke, dp)
-            if (hasClips) {
-                fill.color = theme.accent
-                c.drawCircle(clipRect.centerX() + 7.5f * dp, cy - 7.5f * dp, 2.5f * dp, fill)
+            // `[📋]` Clipboard icon (hidden when clipboard feature is switched off)
+            if (showClipboardIcon) {
+                if (pressedToolbar == ToolbarAction.CLIPBOARD) {
+                    fill.color = theme.keyPressed
+                    c.drawRoundRect(clipRect, 9 * dp, 9 * dp, fill)
+                }
+                KeyDraw.drawClipboardIcon(c, clipRect.centerX(), cy, 18.5f * dp, theme.text, stroke, dp)
+                if (hasClips) {
+                    fill.color = theme.accent
+                    c.drawCircle(clipRect.centerX() + 7.5f * dp, cy - 7.5f * dp, 2.5f * dp, fill)
+                }
             }
 
             // `[🖼]` Recent Photos & Screenshots icon (if room permits)

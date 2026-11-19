@@ -42,19 +42,78 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
         val isScreenshot: Boolean,
     )
 
+    private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r ->
         Thread(r, "ime-img").apply { priority = Thread.NORM_PRIORITY - 1 }
     }
     private val thumbCache = object : LruCache<Long, Bitmap>(28) {}
 
+    private val consumedIds = LinkedHashSet<Long>()
+    private val consumedNames = LinkedHashSet<String>()
+    @Volatile private var lastSentAtMs: Long = 0L
+
     @Volatile var latestFresh: ImageItem? = null
         private set
     @Volatile var latestFreshThumb: Bitmap? = null
         private set
-    private var dismissedId: Long = -1L
     @Volatile var internalUriCopyAt: Long = 0L
         private set
+
+    init {
+        loadConsumedState()
+    }
+
+    @Synchronized
+    private fun loadConsumedState() {
+        prefs.getString(PREF_CONSUMED_IDS, "")
+            ?.split(',')
+            ?.mapNotNull { it.trim().toLongOrNull() }
+            ?.forEach { consumedIds.add(it) }
+        prefs.getString(PREF_CONSUMED_NAMES, "")
+            ?.split('\n')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.forEach { consumedNames.add(it) }
+    }
+
+    @Synchronized
+    private fun recordConsumedLocked(id: Long, displayName: String) {
+        consumedIds.add(id)
+        while (consumedIds.size > 50) {
+            val first = consumedIds.iterator().next()
+            consumedIds.remove(first)
+        }
+        if (displayName.isNotBlank()) {
+            consumedNames.add(displayName)
+            while (consumedNames.size > 50) {
+                val first = consumedNames.iterator().next()
+                consumedNames.remove(first)
+            }
+        }
+        prefs.edit()
+            .putString(PREF_CONSUMED_IDS, consumedIds.joinToString(","))
+            .putString(PREF_CONSUMED_NAMES, consumedNames.joinToString("\n"))
+            .apply()
+    }
+
+    @Synchronized
+    private fun isConsumed(item: ImageItem): Boolean =
+        item.id in consumedIds || (item.displayName.isNotBlank() && item.displayName in consumedNames)
+
+    private fun markConsumed(item: ImageItem, isSend: Boolean) {
+        synchronized(this) {
+            recordConsumedLocked(item.id, item.displayName)
+            if (isSend) lastSentAtMs = System.currentTimeMillis()
+        }
+        latestFresh = null
+        latestFreshThumb = null
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            onFreshChanged()
+        } else {
+            mainHandler.post(onFreshChanged)
+        }
+    }
 
     private val observer = object : ContentObserver(mainHandler) {
         override fun onChange(selfChange: Boolean) {
@@ -86,17 +145,20 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
     fun hasPermission(): Boolean = hasImagePermission(context)
 
     fun dismissFresh() {
-        latestFresh?.let { dismissedId = it.id }
-        latestFresh = null
-        latestFreshThumb = null
-        onFreshChanged()
+        val cur = latestFresh
+        if (cur != null) {
+            markConsumed(cur, isSend = false)
+        } else {
+            latestFreshThumb = null
+            onFreshChanged()
+        }
     }
 
-    /** Checks if `latestFresh` is still within the 90-second freshness window. */
+    /** Checks if `latestFresh` is still within the 90-second freshness window and not already sent/dismissed. */
     fun activeFresh(): Pair<ImageItem, Bitmap?>? {
         val item = latestFresh ?: return null
         val nowSec = System.currentTimeMillis() / 1000L
-        if (item.id == dismissedId || nowSec - item.dateAddedSec > FRESH_WINDOW_SEC) {
+        if (isConsumed(item) || nowSec - item.dateAddedSec > FRESH_WINDOW_SEC) {
             latestFresh = null
             latestFreshThumb = null
             return null
@@ -113,9 +175,25 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
             return
         }
         worker.execute {
-            val recent = queryRecentBlocking(limit = 3, screenshotsOnly = false)
-            val nowSec = System.currentTimeMillis() / 1000L
-            val fresh = recent.firstOrNull { it.id != dismissedId && nowSec - it.dateAddedSec in -5L..FRESH_WINDOW_SEC }
+            val recent = queryRecentBlocking(limit = 4, screenshotsOnly = false)
+            val nowMs = System.currentTimeMillis()
+            val nowSec = nowMs / 1000L
+            val inPostSendCooldown = nowMs - lastSentAtMs in 0L..POST_SEND_COOLDOWN_MS
+
+            var fresh: ImageItem? = null
+            for (cand in recent) {
+                if (nowSec - cand.dateAddedSec !in -5L..FRESH_WINDOW_SEC) continue
+                if (isConsumed(cand)) continue
+                // Chat apps (e.g. WeChat) often save a compressed copy to Pictures/WeiXin right after
+                // sending an image; auto-consume non-screenshot echoes during the post-send window.
+                if (inPostSendCooldown && !cand.isScreenshot) {
+                    synchronized(this) { recordConsumedLocked(cand.id, cand.displayName) }
+                    continue
+                }
+                fresh = cand
+                break
+            }
+
             val thumb = fresh?.let { loadThumbnailBlocking(it, 96) }
             val changed = fresh?.id != latestFresh?.id
             latestFresh = fresh
@@ -131,7 +209,6 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
         }
         worker.execute {
             val list = queryRecentBlocking(limit = limit, screenshotsOnly = screenshotsOnly)
-            // Warm thumbnails for the first visible cells
             for (item in list.take(12)) loadThumbnailBlocking(item, 180)
             mainHandler.post { callback(list) }
         }
@@ -220,10 +297,13 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
 
     /**
      * Sends [item] directly into the current editor via `InputConnectionCompat.commitContent`
-     * (supported natively by WeChat, QQ, Telegram, Messages, Chrome, Notes, etc.), falling back
-     * to copying the `content://` image URI to the clipboard when unsupported.
+     * and immediately marks [item] as consumed so the top-bar bubble never lingers after sending.
      */
     fun sendImage(ic: InputConnection?, editorInfo: EditorInfo?, item: ImageItem): Boolean {
+        // Always consume immediately on user tap so the bubble disappears right away and never re-appears.
+        latestFresh?.let { if (it.id != item.id) markConsumed(it, isSend = true) }
+        markConsumed(item, isSend = true)
+
         if (ic == null || editorInfo == null) return false
         val supportedMimes = EditorInfoCompat.getContentMimeTypes(editorInfo)
         val mimeSupported = supportedMimes.any { pattern ->
@@ -238,34 +318,28 @@ class RecentImageStore(private val context: Context, private val onFreshChanged:
                 contentInfo.requestPermission()
                 InputConnectionCompat.commitContent(ic, editorInfo, contentInfo, flags, null)
             }.getOrDefault(false)
-            if (ok) {
-                if (latestFresh?.id == item.id) dismissFresh()
-                return true
-            }
+            if (ok) return true
         }
 
-        // Try direct commitContent even when app forgot to populate contentMimeTypes
         val fallbackDirect = runCatching {
             InputConnectionCompat.commitContent(ic, editorInfo, contentInfo, flags, null)
         }.getOrDefault(false)
-        if (fallbackDirect) {
-            if (latestFresh?.id == item.id) dismissFresh()
-            return true
-        }
+        if (fallbackDirect) return true
 
-        // Universal fallback: copy image URI to system clipboard so user can paste in chat apps
         runCatching {
             internalUriCopyAt = System.currentTimeMillis()
             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
             cm?.setPrimaryClip(ClipData.newUri(context.contentResolver, item.displayName, item.uri))
             Toast.makeText(context, "当前输入框不支持直传，已复制图片可长按粘贴", Toast.LENGTH_SHORT).show()
         }
-        if (latestFresh?.id == item.id) dismissFresh()
         return false
     }
 
     companion object {
         private const val FRESH_WINDOW_SEC = 90L
+        private const val POST_SEND_COOLDOWN_MS = 15_000L
+        private const val PREF_CONSUMED_IDS = "consumed_image_ids"
+        private const val PREF_CONSUMED_NAMES = "consumed_image_names"
 
         fun hasImagePermission(context: Context): Boolean {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

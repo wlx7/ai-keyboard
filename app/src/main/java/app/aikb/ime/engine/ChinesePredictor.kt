@@ -96,6 +96,15 @@ class ChinesePredictor(
         userFile?.delete()
     }
 
+    @Synchronized
+    fun allLearnedPairs(): List<Triple<String, String, Int>> {
+        val out = ArrayList<Triple<String, String, Int>>()
+        for ((head, map) in userBigrams) {
+            for ((next, cnt) in map) out += Triple(head, next, cnt)
+        }
+        return out
+    }
+
     /**
      * Predicts up to [max] natural Chinese continuations following [textBeforeCursor].
      */

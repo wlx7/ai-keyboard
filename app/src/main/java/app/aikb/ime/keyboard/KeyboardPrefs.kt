@@ -31,6 +31,7 @@ data class KeyboardPrefs(
     val spaceCnNum: Boolean = false,
     val spaceCnEn: Boolean = false,
     val otpAutoFill: Boolean = true,
+    val clipboardEnabled: Boolean = true,
     val postCommitPredict: Boolean = true,
     val spaceSwipeCursor: Boolean = true,
     val swipeDeleteWord: Boolean = true,
@@ -59,6 +60,7 @@ data class KeyboardPrefs(
         const val KEY_SPACE_CN_NUM = "space_cn_num"
         const val KEY_SPACE_CN_EN = "space_cn_en"
         const val KEY_OTP_AUTOFILL = "otp_autofill"
+        const val KEY_CLIPBOARD_ENABLED = "clipboard_enabled"
         const val KEY_POST_PREDICT = "post_commit_predict"
         const val KEY_SPACE_SWIPE = "space_swipe_cursor"
         const val KEY_SWIPE_DELETE = "swipe_delete_word"
@@ -72,7 +74,7 @@ data class KeyboardPrefs(
             KEY_ONE_HAND_ALIGN, KEY_BOTTOM_OFFSET_DP, KEY_FONT_SCALE, KEY_CAND_FONT_SCALE,
             KEY_NUMBER_ROW, KEY_SHOW_HINTS, KEY_PREVIEW, KEY_LONG_PRESS_MS, KEY_HAPTIC_MS,
             KEY_SMART_PINYIN_CORRECT, KEY_ENTER_TO_SEND, KEY_SPACE_CN_NUM, KEY_SPACE_CN_EN,
-            KEY_OTP_AUTOFILL, KEY_POST_PREDICT, KEY_SPACE_SWIPE, KEY_SWIPE_DELETE,
+            KEY_OTP_AUTOFILL, KEY_CLIPBOARD_ENABLED, KEY_POST_PREDICT, KEY_SPACE_SWIPE, KEY_SWIPE_DELETE,
             KEY_SCREENSHOT_BUBBLE, KEY_HW_HEIGHT_SCALE, KEY_HW_STROKE_DP, KEY_HW_AUTOCOMMIT_MS,
             "haptics", "sound", "auto_correct", "auto_caps", "double_space",
         )
@@ -105,6 +107,7 @@ data class KeyboardPrefs(
             spaceCnNum = p.getBoolean(KEY_SPACE_CN_NUM, false),
             spaceCnEn = p.getBoolean(KEY_SPACE_CN_EN, false),
             otpAutoFill = p.getBoolean(KEY_OTP_AUTOFILL, true),
+            clipboardEnabled = p.getBoolean(KEY_CLIPBOARD_ENABLED, true),
             postCommitPredict = p.getBoolean(KEY_POST_PREDICT, true),
             spaceSwipeCursor = p.getBoolean(KEY_SPACE_SWIPE, true),
             swipeDeleteWord = p.getBoolean(KEY_SWIPE_DELETE, true),

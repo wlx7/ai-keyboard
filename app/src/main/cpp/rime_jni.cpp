@@ -445,9 +445,10 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
 
         // Helper: re-establish spine state by feeding input and replaying [spineChoices]
         auto restoreSpine = [&](const std::vector<size_t>& spineChoices) -> bool {
+            if (g_abortExplore) return false;
             exploreFeed(in);
             for (size_t idx : spineChoices) {
-                if (!g_api->select_candidate(g_explore, idx)) return false;
+                if (g_abortExplore || !g_api->select_candidate(g_explore, idx)) return false;
             }
             return true;
         };
@@ -461,10 +462,10 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
         size_t covered = 0;
         const size_t totalSyl = static_cast<size_t>(std::max<jint>(syllables, 0));
 
-        for (int step = 0; step < 10 && covered < totalSyl && !g_abortExplore && out.size() < 24; ++step) {
+        for (int step = 0; step < 6 && covered < totalSyl && !g_abortExplore && out.size() < 20; ++step) {
             const size_t rem = totalSyl - covered;
-            const int branchLimit = (step == 0) ? std::max<int>(firstK, 6) : 4;
-            const int directLimit = (rem <= 3) ? 14 : 8;
+            const int branchLimit = (step == 0) ? std::max<int>(firstK, 5) : 3;
+            const int directLimit = (rem <= 3) ? 12 : 6;
             auto cands = exploreCandidates(std::max(branchLimit * 3 + 4, directLimit + 4));
             if (cands.empty()) break;
 
@@ -476,16 +477,22 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
                 if (len > 0 && len <= rem) { spineIdx = static_cast<int>(i); break; }
             }
 
-            // Explore alternative words at this segment position
+            // Explore alternative words at this segment position.
+            // Note: librime orders menu candidates from longest input span (`end == input.size()`) down to
+            // shorter prefix spans (`end < input.size()`). Once we encounter any candidate with `len < rem`,
+            // Rime has moved to partial-prefix matches, so any later candidate whose Hanzi count happens to
+            // equal `rem` via super-abbreviation (`jinrich` -> `纪念日` matching only `jinri`) does NOT cover
+            // the full remaining input and MUST NOT be accepted as a direct full-span completion!
             int branched = 0;
             int directAdded = 0;
-            for (size_t i = 0; i < cands.size() && !g_abortExplore && out.size() < 24; ++i) {
-                if (static_cast<int>(i) == spineIdx && !(cands[i].second == rem)) continue;
+            bool seenPartialSpan = false;
+            for (size_t i = 0; i < cands.size() && !g_abortExplore && out.size() < 20; ++i) {
                 const auto& [txt, len] = cands[i];
+                if (len > 0 && len < rem) seenPartialSpan = true;
+                if (static_cast<int>(i) == spineIdx && !(cands[i].second == rem)) continue;
                 if (len == 0 || len > rem) continue;
                 if (len == rem) {
-                    // Completes the rest of the sentence: read directly at zero extra decode cost!
-                    if (directAdded < directLimit) {
+                    if (!seenPartialSpan && directAdded < directLimit) {
                         add(prefixText + txt);
                         ++directAdded;
                     }
@@ -498,14 +505,19 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
                 add(branchSent);
 
                 // Look one more segment ahead for consecutive homophone pairs (e.g. "网上" + "订")
-                if (secondK > 0 && step < 4 && out.size() < 24) {
+                if (secondK > 0 && step < 3 && out.size() < 20 && !g_abortExplore) {
                     const size_t rem2 = rem - len;
                     auto cands2 = exploreCandidates(secondK * 2 + 4);
                     int b2 = 0;
+                    bool seenPartial2 = false;
                     for (size_t j = 0; j < cands2.size() && b2 < secondK && !g_abortExplore; ++j) {
                         const auto& [t2, l2] = cands2[j];
+                        if (l2 > 0 && l2 < rem2) seenPartial2 = true;
                         if (l2 == 0 || l2 > rem2) continue;
-                        if (l2 == rem2) { add(prefixText + txt + t2); ++b2; continue; }
+                        if (l2 == rem2) {
+                            if (!seenPartial2) { add(prefixText + txt + t2); ++b2; }
+                            continue;
+                        }
                         if (j == 0) continue; // j==0 is already in branchSent
                         ++b2;
                         if (g_api->select_candidate(g_explore, j)) {

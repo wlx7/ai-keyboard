@@ -23,12 +23,14 @@ object AiRanker {
     private const val TAG = "AiRanker"
 
     /** Default weight of librime's order, tuned on tools/eval (see ROADMAP.md). */
-    const val DEFAULT_ALPHA = 3.0f
+    const val DEFAULT_ALPHA = 3.2f
 
     /** The AI must beat librime's first choice by this many nats before overriding it. */
-    @Volatile var margin = 0.95f
+    @Volatile var margin = 1.75f
     const val MIN_SYLLABLES = 3
     const val MIN_CONTEXTUAL_SYLLABLES = 2
+    /** Minimum average log-probability per Hanzi required to promote an AI candidate to #1 (blocks stitched gibberish). */
+    private const val MIN_AVG_CHAR_LOGPROB = -4.80f
     private const val MIN_ALPHA = 0.5f
     private const val MAX_ALPHA = 8f
     private const val MAX_CANDIDATES = 20
@@ -154,14 +156,20 @@ object AiRanker {
     /** Index (into [candidates]) of the best candidate under [a]. */
     fun best(s: Scored, candidates: List<String>, a: Float = alpha, useCache: Boolean = true, m: Float = margin): Int {
         var best = s.indices[0]
+        var bestRank = 0
         var bestScore = Float.NEGATIVE_INFINITY
         s.indices.forEachIndexed { rank, i ->
             val score = s.lm[rank] - a * ln(1f + rank) + (if (useCache) cacheBoost(candidates[i]) else 0f)
-            if (score > bestScore) { bestScore = score; best = i }
+            if (score > bestScore) { bestScore = score; best = i; bestRank = rank }
         }
         val first = s.indices[0]
         val firstScore = s.lm[0] + (if (useCache) cacheBoost(candidates[first]) else 0f)
-        return if (best != first && bestScore - firstScore < m) first else best
+        if (best != first) {
+            val charLen = candidates[best].codePointCount(0, candidates[best].length).coerceAtLeast(1)
+            val avgLogProb = s.lm[bestRank] / charLen
+            if (bestScore - firstScore < m || avgLogProb < MIN_AVG_CHAR_LOGPROB) return first
+        }
+        return best
     }
 
     /** Schemes whose input is pinyin (the AI applies); shape-based 五笔/仓颉 are left alone. */
@@ -181,20 +189,22 @@ object AiRanker {
         val alts = RimeEngine.alternatives(schema, input, syllables)
         if (stale()) return null
         val s = scoreRaw(context, alts, syllables)
-        val effMargin = if (syllables == 2) 0.85f else margin
+        val effMargin = if (syllables == 2) 1.45f else margin
         val top = s?.let { best(it, alts, m = effMargin) }
         Log.d(TAG, "suggest syl=$syllables alts=${alts.size} scored=${s?.indices?.size} changed=${s != null && top != s.indices[0]} " +
             "in ${android.os.SystemClock.elapsedRealtime() - t0} ms")
         if (s == null || top == null || top == s.indices[0]) return null
 
-        // Also surface second-best distinct AI sentence if significantly stronger than default
+        // Also surface second-best distinct AI sentence only if strongly fluent and superior
         var second: String? = null
         var secondScore = Float.NEGATIVE_INFINITY
         val firstScore = s.lm[0] + cacheBoost(alts[s.indices[0]])
         s.indices.forEachIndexed { rank, idx ->
             if (idx == top || idx == s.indices[0]) return@forEachIndexed
+            val charLen = alts[idx].codePointCount(0, alts[idx].length).coerceAtLeast(1)
+            if (s.lm[rank] / charLen < MIN_AVG_CHAR_LOGPROB) return@forEachIndexed
             val sc = s.lm[rank] - alpha * ln(1f + rank) + cacheBoost(alts[idx])
-            if (sc > secondScore && sc - firstScore >= effMargin) {
+            if (sc > secondScore && sc - firstScore >= effMargin + 0.8f) {
                 secondScore = sc
                 second = alts[idx]
             }

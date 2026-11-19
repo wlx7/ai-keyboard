@@ -41,6 +41,8 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
         set(v) { field = v; invalidate() }
     var clipCount: Int = 0
         set(v) { field = v; invalidate() }
+    var clipboardEnabled: Boolean = true
+        set(v) { field = v; invalidate() }
 
     private val modes = InputMode.entries
     private val tiles = Tile.entries
@@ -159,7 +161,11 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             }
 
             val title = when (tile) {
-                Tile.CLIPBOARD -> if (clipCount > 0) "剪贴板($clipCount)" else "剪贴板"
+                Tile.CLIPBOARD -> when {
+                    !clipboardEnabled -> "剪贴板(已关)"
+                    clipCount > 0 -> "剪贴板($clipCount)"
+                    else -> "剪贴板"
+                }
                 Tile.IMAGES -> "图片/截图"
                 Tile.VOICE -> "离线语音"
                 Tile.RESIZE -> "键盘大小"
