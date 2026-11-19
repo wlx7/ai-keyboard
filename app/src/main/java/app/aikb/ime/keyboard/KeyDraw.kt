@@ -237,4 +237,39 @@ object KeyDraw {
         c.drawLine(cx - s, cy - dir * s * 0.48f, cx, cy + dir * s * 0.48f, stroke)
         c.drawLine(cx, cy + dir * s * 0.48f, cx + s, cy - dir * s * 0.48f, stroke)
     }
+
+    /** Photo / screenshot landscape frame icon. */
+    fun drawImageIcon(c: Canvas, cx: Float, cy: Float, s: Float, color: Int, fill: Paint, stroke: Paint, path: Path, dp: Float) {
+        stroke.color = color
+        stroke.strokeWidth = 1.6f * dp
+        val w = s * 0.46f
+        val h = s * 0.38f
+        c.drawRoundRect(cx - w, cy - h, cx + w, cy + h, 2.5f * dp, 2.5f * dp, stroke)
+        fill.color = color
+        c.drawCircle(cx - w * 0.42f, cy - h * 0.35f, 1.5f * dp, fill)
+        path.reset()
+        path.moveTo(cx - w * 0.78f, cy + h * 0.68f)
+        path.lineTo(cx - w * 0.18f, cy + h * 0.05f)
+        path.lineTo(cx + w * 0.22f, cy + h * 0.45f)
+        path.lineTo(cx + w * 0.48f, cy + h * 0.15f)
+        path.lineTo(cx + w * 0.80f, cy + h * 0.68f)
+        c.drawPath(path, stroke)
+    }
+
+    /** Four-corner resize / scale icon. */
+    fun drawResizeIcon(c: Canvas, cx: Float, cy: Float, s: Float, color: Int, stroke: Paint, dp: Float) {
+        stroke.color = color
+        stroke.strokeWidth = 1.65f * dp
+        val d = s * 0.40f
+        val arm = s * 0.22f
+        // Top-left & bottom-right corner brackets
+        c.drawLine(cx - d, cy - d, cx - d + arm, cy - d, stroke)
+        c.drawLine(cx - d, cy - d, cx - d, cy - d + arm, stroke)
+        c.drawLine(cx + d, cy - d, cx + d - arm, cy - d, stroke)
+        c.drawLine(cx + d, cy - d, cx + d, cy - d + arm, stroke)
+        c.drawLine(cx - d, cy + d, cx - d + arm, cy + d, stroke)
+        c.drawLine(cx - d, cy + d, cx - d, cy + d - arm, stroke)
+        c.drawLine(cx + d, cy + d, cx + d - arm, cy + d, stroke)
+        c.drawLine(cx + d, cy + d, cx + d, cy + d - arm, stroke)
+    }
 }

@@ -237,8 +237,12 @@ object RimeEngine {
     fun select(index: Int): Boolean = isReady && Rime.nativeSelectCandidate(index)
 
     /** Whole-sentence alternatives for [input]; safe to call from a background thread. */
-    fun alternatives(schema: String, input: String, syllables: Int, firstK: Int = 4, secondK: Int = 2): List<String> =
+    fun alternatives(schema: String, input: String, syllables: Int, firstK: Int = 6, secondK: Int = 3): List<String> =
         if (isReady) Rime.nativeAlternatives(schema, input, syllables, firstK, secondK).toList() else emptyList()
+
+    /** Queries top conversions for [input] in Rime's hidden session without side effects (used by PinyinCorrector). */
+    fun queryTop(schema: String, input: String, maxCands: Int = 4): List<String> =
+        if (isReady) Rime.nativeQueryTop(schema, input, maxCands, traditional).toList() else emptyList()
 
     fun forget(index: Int): Boolean = isReady && Rime.nativeDeleteCandidate(index)
 

@@ -130,6 +130,12 @@ public class BuildChinesePredict {
             {"问一", "下"},
             {"想一", "下,想"},
             {"休息", "一下,吧,时间"},
+            {"秋水", "时至,共长天,伊人,长天"},
+            {"百川", "灌河,归海"},
+            {"落霞", "与孤鹜,孤鹜"},
+            {"大模", "型"},
+            {"大模型", "蒸馏,推理,训练,部署,应用"},
+            {"智能", "体,纠错,输入法,选句,家居"},
         };
         for (String[] row : pairs) {
             String head = row[0];
@@ -149,11 +155,15 @@ public class BuildChinesePredict {
 
         seedConversational(table);
 
-        // 1. Load rime-ice base.dict.yaml & ext.dict.yaml for vocabulary + compound/idiom continuations
+        // 1. Load rime-ice + sogou_cell + tencent dicts for vocabulary + compound/idiom continuations
+        Path appCn = Paths.get("app/src/main/assets/rime/cn_dicts");
         Path[] dicts = {
+            appCn.resolve("base.dict.yaml"),
+            appCn.resolve("ext.dict.yaml"),
+            appCn.resolve("sogou_cell.dict.yaml"),
+            appCn.resolve("tencent.dict.yaml"),
+            appCn.resolve("8105.dict.yaml"),
             dataDir.resolve("rime-src/rime-ice/cn_dicts/base.dict.yaml"),
-            dataDir.resolve("rime-src/rime-ice/cn_dicts/ext.dict.yaml"),
-            dataDir.resolve("rime-src/rime-ice/cn_dicts/8105.dict.yaml")
         };
 
         Map<String, Long> wordFreq = new HashMap<>(200_000);
@@ -281,8 +291,8 @@ public class BuildChinesePredict {
         }
 
         candidates.sort((a, b) -> Double.compare(b.totalScore, a.totalScore));
-        if (candidates.size() > 24_000) {
-            candidates = new ArrayList<>(candidates.subList(0, 24_000));
+        if (candidates.size() > 36_000) {
+            candidates = new ArrayList<>(candidates.subList(0, 36_000));
         }
 
         // Sort lexicographically by unsigned UTF-8 bytes for binary search!

@@ -19,15 +19,25 @@ data class EnglishResult(
 class EnglishEngine(private val dict: EnglishDictionary, private val history: UserHistory) {
 
     private val rows = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
-    private val pos: Map<Char, Pair<Float, Int>> = buildMap {
-        rows.forEachIndexed { r, row -> row.forEachIndexed { c, ch -> put(ch, (c + r * 0.5f) to r) } }
+    private val pos: Map<Char, Pair<Float, Float>> = buildMap {
+        val offsets = floatArrayOf(0f, 0.45f, 0.95f)
+        rows.forEachIndexed { r, row -> row.forEachIndexed { c, ch -> put(ch, (c + offsets[r]) to r.toFloat()) } }
     }
 
-    private fun adjacent(a: Char, b: Char): Boolean {
-        val pa = pos[a] ?: return false
-        val pb = pos[b] ?: return false
-        return kotlin.math.abs(pa.second - pb.second) <= 1 && kotlin.math.abs(pa.first - pb.first) <= 1.0f
+    private fun keyDist(a: Char, b: Char): Float {
+        val pa = pos[a] ?: return 9f
+        val pb = pos[b] ?: return 9f
+        return kotlin.math.hypot(pa.first - pb.first, pa.second - pb.second)
     }
+
+    private val commonMisspellings = mapOf(
+        "teh" to "the", "adn" to "and", "taht" to "that", "wiht" to "with", "thier" to "their",
+        "recieve" to "receive", "beleive" to "believe", "wierd" to "weird", "acheive" to "achieve",
+        "definately" to "definitely", "definitly" to "definitely", "seperate" to "separate",
+        "occured" to "occurred", "untill" to "until", "tommorow" to "tomorrow", "tomorow" to "tomorrow",
+        "goverment" to "government", "enviroment" to "environment", "acommodate" to "accommodate",
+        "alot" to "a lot", "thankyou" to "thank you", "nevermind" to "never mind",
+    )
 
     /**
      * Next-word predictions when nothing is currently being composed (right after space).
@@ -142,7 +152,10 @@ class EnglishEngine(private val dict: EnglishDictionary, private val history: Us
         // user's own words that the dictionary lacks
         for ((w, c) in history.withPrefix(key, 5)) offer(w, 110.0 + 18.0 * ln(1.0 + c), false)
 
-        // 3) corrections at edit distance 1 (substitution / deletion / insertion / transposition)
+        // 3) Spatial Euclidean edit-distance-1 + common misspellings + missing-space 2-word split
+        commonMisspellings[key]?.let { fixed ->
+            offer(fixed, 215.0 + boost(fixed), true)
+        }
         if (key.length >= 2) {
             val seen = HashSet<String>()
             fun tryKey(k: String, penalty: Double, allowCtx: Boolean = true) {
@@ -156,15 +169,44 @@ class EnglishEngine(private val dict: EnglishDictionary, private val history: Us
             for (p in key.indices) {
                 for (ch in 'a'..'z') {
                     if (ch == key[p]) continue
-                    val pen = if (adjacent(ch, key[p])) 34.0 else 62.0
+                    val dist = keyDist(ch, key[p])
+                    val pen = when {
+                        dist <= 1.12f -> 23.0 + 7.5 * dist   // direct horizontal/vertical neighbor (~30.5..31.4)
+                        dist <= 1.55f -> 35.5                // close diagonal neighbor
+                        else -> 62.0
+                    }
                     tryKey(key.substring(0, p) + ch + key.substring(p + 1), pen)
                 }
                 if (key.length > 2) tryKey(key.removeRange(p, p + 1), if (p == key.lastIndex) 75.0 else 50.0, allowCtx = p != key.lastIndex)
                 if (p < key.length - 1 && key[p] != key[p + 1])
-                    tryKey(key.substring(0, p) + key[p + 1] + key[p] + key.substring(p + 2), 36.0)
+                    tryKey(key.substring(0, p) + key[p + 1] + key[p] + key.substring(p + 2), 34.0)
             }
             for (p in 0..key.length) for (ch in 'a'..'z')
                 tryKey(key.substring(0, p) + ch + key.substring(p), 46.0)
+        }
+
+        // 4) Missing-space two-word split (e.g. "thebest" -> "the best", "dontknow" -> "don't know")
+        if (key.length in 5..14 && literalFreq < 95) {
+            for (cut in 2..(key.length - 2)) {
+                val r1 = dict.exactRange(key.substring(0, cut))
+                val r2 = dict.exactRange(key.substring(cut))
+                if (r1.isEmpty() || r2.isEmpty()) continue
+                val i1 = r1.maxByOrNull { dict.freq(it) } ?: continue
+                val i2 = r2.maxByOrNull { dict.freq(it) } ?: continue
+                val d1 = dict.display(i1); val d2 = dict.display(i2)
+                if (' ' in d1 || ' ' in d2) continue
+                val f1 = dict.freq(i1); val f2 = dict.freq(i2)
+                var biBoost = 0.0
+                for (packed in dict.bigrams(d1)) {
+                    if (EnglishDictionary.edgeTarget(packed) == i2) {
+                        biBoost = EnglishDictionary.edgeScore(packed) * 0.25
+                        break
+                    }
+                }
+                if ((f1 >= 145 && f2 >= 145) || (biBoost > 20.0 && f1 >= 115 && f2 >= 115)) {
+                    offer("$d1 $d2", minOf(f1, f2) + 8.0 + biBoost, true, allowCtx = false)
+                }
+            }
         }
 
         val ranked = best.values.sortedByDescending { it.score }.take(max).map { it.copy(text = matchCase(typed, it.text)) }

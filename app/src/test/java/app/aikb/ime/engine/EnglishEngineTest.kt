@@ -23,6 +23,12 @@ class EnglishEngineTest {
     @Test fun correctsCommonTypo() = assertEquals("the", engine.suggest("teh").autoCorrect)
     @Test fun correctsAdjacentKey() = assertEquals("hello", engine.suggest("hrllo").autoCorrect)
     @Test fun addsApostrophe() = assertEquals("don't", engine.suggest("dont").autoCorrect)
+    @Test fun correctsMisspellingsAndMissingSpace() {
+        assertEquals("receive", engine.suggest("recieve").autoCorrect)
+        assertEquals("definitely", engine.suggest("definately").autoCorrect)
+        val splitCands = engine.suggest("thebest").suggestions.map { it.text }
+        assertTrue("Expected 'the best' in $splitCands", "the best" in splitCands)
+    }
     @Test fun capitalI() = assertEquals("I", engine.suggest("i").suggestions.first().text)
     @Test fun keepsValidWord() = assertNull(engine.suggest("cat").autoCorrect)
     @Test fun keepsCase() = assertEquals("The", engine.suggest("Teh").autoCorrect)

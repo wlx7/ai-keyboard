@@ -44,6 +44,14 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
 
     var theme: KbTheme = KbTheme.of(context)
         set(v) { field = v; invalidate() }
+    var prefs: KeyboardPrefs = KeyboardPrefs()
+        set(v) {
+            val hChanged = field.heightScale != v.heightScale
+            field = v
+            if (hChanged) requestLayout()
+            layoutRects(width)
+            invalidate()
+        }
     var chinese = true
         set(v) { field = v; invalidate() }
     var enterLabel = "换行"
@@ -58,12 +66,12 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
         set(v) { field = v; sideScroll = 0f; invalidate() }
     var sideHighlightsFirst = false
 
-    private val topPad = 8 * dp
-    private val bottomPad = 4 * dp
-    private val rowPitch = 54 * dp
-    private val gap = 6 * dp
-    private val radius = 5.5f * dp
-    private val sideItemH = 40 * dp
+    private val topPad get() = 6f * dp
+    private val bottomPad get() = 5f * dp
+    private val rowPitch get() = 53.5f * dp * prefs.heightScale
+    private val gap get() = 5.5f * dp
+    private val radius get() = prefs.keyRadiusDp * dp
+    private val sideItemH get() = 39f * dp * prefs.heightScale.coerceIn(0.88f, 1.15f)
 
     private val buttons = listOf(
         Btn(Kind.SEPARATOR, "分词"), Btn(Kind.DIGIT, "ABC", '2'), Btn(Kind.DIGIT, "DEF", '3'), Btn(Kind.DELETE, ""),
@@ -100,12 +108,17 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
         setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), (topPad + 4 * rowPitch + bottomPad).toInt())
     }
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) = layoutRects(w)
+
+    private fun layoutRects(w: Int) {
+        if (w <= 0) return
         val unit = (w - 6 * dp) / 10f
         val x0 = 3 * dp
         val cols = floatArrayOf(x0, x0 + 1.9f * unit, x0 + 3.9f * unit, x0 + 5.9f * unit, x0 + 7.9f * unit, x0 + 10f * unit)
+        val rp = rowPitch
+        val gp = gap
         fun cell(c0: Int, c1: Int, r: Int) =
-            RectF(cols[c0] + gap / 2, topPad + r * rowPitch + gap, cols[c1] - gap / 2, topPad + (r + 1) * rowPitch - gap)
+            RectF(cols[c0] + gp / 2, topPad + r * rp + gp * 0.8f, cols[c1] - gp / 2, topPad + (r + 1) * rp - gp * 0.8f)
         side.set(cell(0, 1, 0).left, cell(0, 1, 0).top, cell(0, 1, 2).right, cell(0, 1, 2).bottom)
         var i = 0
         for (r in 0..2) for (c in 1..4) buttons[i++].rect.set(cell(c, c + 1, r))
@@ -124,8 +137,10 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
     }
 
     private fun drawSide(c: Canvas) {
-        fill.color = theme.keyShadow
-        c.drawRoundRect(side.left, side.top + 1.2f * dp, side.right, side.bottom + 1.2f * dp, radius, radius, fill)
+        if (theme.keyShadow != 0) {
+            fill.color = theme.keyShadow
+            c.drawRoundRect(side.left, side.top + 1.1f * dp, side.right, side.bottom + 1.2f * dp, radius, radius, fill)
+        }
         fill.color = theme.funcKey
         c.drawRoundRect(side, radius, radius, fill)
         c.save()
@@ -151,28 +166,32 @@ class T9View(context: Context, private val listener: Listener) : View(context) {
         val rc = b.rect
         val func = b.kind !in setOf(Kind.DIGIT, Kind.SPACE, Kind.SEPARATOR)
         val accent = b.kind == Kind.ENTER && enterAccent
-        fill.color = theme.keyShadow
-        c.drawRoundRect(rc.left, rc.top + 1.2f * dp, rc.right, rc.bottom + 1.2f * dp, radius, radius, fill)
+        val rad = radius
+        if (theme.keyShadow != 0) {
+            fill.color = theme.keyShadow
+            c.drawRoundRect(rc.left, rc.top + 1.1f * dp, rc.right, rc.bottom + 1.2f * dp, rad, rad, fill)
+        }
         fill.color = when {
-            accent -> if (pressed) theme.funcKey else theme.accent
+            accent -> if (pressed) theme.funcKeyPressed else theme.accent
             func -> if (pressed) theme.funcKeyPressed else theme.funcKey
             else -> if (pressed) theme.keyPressed else theme.key
         }
-        c.drawRoundRect(rc, radius, radius, fill)
+        c.drawRoundRect(rc, rad, rad, fill)
         val fg = if (accent && !pressed) theme.accentText else theme.text
         val cx = rc.centerX(); val cy = rc.centerY()
-        val u = minOf(sp, dp * 1.12f)
+        val u = minOf(sp, dp * 1.12f) * prefs.keyFontScale
+        val iconS = minOf(rc.width(), rc.height()) * 0.50f
         when (b.kind) {
             Kind.DIGIT -> {
-                label(c, b.digit.toString(), cx, rc.top + 11 * dp, 11 * u, theme.textSecondary)
-                label(c, b.label, cx, cy + 3 * dp, 18.5f * u, fg)
+                label(c, b.digit.toString(), cx, rc.top + rc.height() * 0.27f, 10.5f * u, theme.textSecondary)
+                label(c, b.label, cx, cy + rc.height() * 0.08f, 17.8f * u, fg)
             }
-            Kind.DELETE -> drawDelete(c, cx, cy, 22 * dp, fg)
-            Kind.EMOJI -> drawEmoji(c, cx, cy, 21 * dp, fg)
-            Kind.SPACE -> KeyDraw.drawKeyText(c, spaceLabel, rc, 15.0f * u, fg, text, dp)
-            Kind.ENTER -> KeyDraw.drawKeyText(c, enterLabel, rc, 15.0f * u, fg, text, dp, bold = accent)
-            Kind.LANG -> KeyDraw.drawLangBadge(c, rc, chinese, fg, text, dp, sp)
-            else -> KeyDraw.drawKeyText(c, b.label, rc, 15.0f * u, fg, text, dp, padH = 3.5f * dp)
+            Kind.DELETE -> drawDelete(c, cx, cy, iconS.coerceIn(16 * dp, 21 * dp), fg)
+            Kind.EMOJI -> drawEmoji(c, cx, cy, iconS.coerceIn(16 * dp, 20 * dp), fg)
+            Kind.SPACE -> KeyDraw.drawKeyText(c, spaceLabel, rc, 14.5f * u, fg, text, dp)
+            Kind.ENTER -> KeyDraw.drawKeyText(c, enterLabel, rc, 14.5f * u, fg, text, dp, bold = accent)
+            Kind.LANG -> KeyDraw.drawLangBadge(c, rc, chinese, fg, text, dp, sp * prefs.keyFontScale)
+            else -> KeyDraw.drawKeyText(c, b.label, rc, 14.5f * u, fg, text, dp, padH = 3.5f * dp)
         }
     }
 

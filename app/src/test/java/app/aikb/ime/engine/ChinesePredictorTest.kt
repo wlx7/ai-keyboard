@@ -35,6 +35,9 @@ class ChinesePredictorTest {
         val idiom = p.predict("祝你一帆", max = 4)
         assertTrue("Expected 风顺 after 一帆, got $idiom", "风顺" in idiom)
 
+        val classical = p.predict("秋水", max = 6)
+        assertTrue("Expected 时至 in predictions after 秋水, got $classical", "时至" in classical)
+
         val emptyAfterPunct = p.predict("今天天气真好。", max = 6)
         assertTrue("Should not predict immediately after sentence period", emptyAfterPunct.isEmpty())
     }

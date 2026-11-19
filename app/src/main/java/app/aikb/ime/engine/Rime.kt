@@ -27,4 +27,6 @@ object Rime {
     @JvmStatic external fun nativeSyncUserData()
     /** Whole-sentence alternatives for [input] (librime order first), explored in a hidden session. */
     @JvmStatic external fun nativeAlternatives(schema: String, input: String, syllables: Int, firstK: Int, secondK: Int): Array<String>
+    /** Zero-side-effect candidate lookup for smart pinyin typo correction using the hidden explore session. */
+    @JvmStatic external fun nativeQueryTop(schema: String, input: String, maxCands: Int, traditional: Boolean): Array<String>
 }

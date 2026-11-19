@@ -22,6 +22,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         fun onText(key: Key, text: String)
         fun onFunction(key: Key)
         fun onDeleteDown(repeat: Boolean)
+        fun onSwipeDeleteWord() {}
         fun onCursorMove(steps: Int)
         fun onLongPressFunction(key: Key)
         fun onKeyDownFeedback(key: Key)
@@ -32,6 +33,14 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     var theme: KbTheme = KbTheme.of(context)
         set(v) { field = v; invalidate() }
+    var prefs: KeyboardPrefs = KeyboardPrefs()
+        set(v) {
+            val sizeChanged = field.heightScale != v.heightScale
+            field = v
+            if (sizeChanged) requestLayout()
+            computeRects()
+            invalidate()
+        }
     var layout: Layout = Layouts.letters(BottomRow.TEXT, false)
         set(v) { field = v; cancelAll(); requestLayout(); computeRects(); invalidate() }
     var shift: ShiftState = ShiftState.OFF
@@ -43,26 +52,32 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     var enterAccent = false
         set(v) { field = v; invalidate() }
 
-    /** Small glyphs shown in the corner of letter keys (五笔/仓颉 radicals). */
+    /** Small glyphs shown in the top-right corner of letter keys (symbols or 五笔/仓颉 radicals). */
     var hints: Map<Char, String> = emptyMap()
         set(v) { field = v; invalidate() }
 
     /** Draws key previews / alternates above the keys, may extend over the candidate bar. */
     var previewOverlay: PreviewOverlay? = null
 
-    private val topPad = 8 * dp
-    private val bottomPad = 4 * dp
-    private val sidePad = 3 * dp
-    private val rowPitch = 54 * dp
-    private val hGap = 6 * dp
-    private val vGap = 11 * dp
-    private val radius = 5.5f * dp
+    private val topPad get() = 6f * dp
+    private val bottomPad get() = 5f * dp
+    private val sidePad get() = 3.5f * dp
+    private val baseRowPitch get() = if (layout.rows.size >= 5) 48.5f * dp else 53.5f * dp
+    private val rowPitch get() = baseRowPitch * prefs.heightScale
+    private val hGap get() = 5.5f * dp
+    private val vGap get() = (if (layout.rows.size >= 5) 7.5f else 9.0f) * dp * (0.65f + 0.35f * prefs.heightScale)
+    private val radius get() = prefs.keyRadiusDp * dp
 
     private var rects: List<List<RectF>> = emptyList()
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND }
-    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER; typeface = Typeface.create("sans-serif", Typeface.NORMAL) }
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+    }
+    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+    }
     private val path = Path()
 
     private val handler = Handler(Looper.getMainLooper())
@@ -72,6 +87,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         var alts: List<String> = emptyList()
         var altIndex = 0
         var cursorMode = false
+        var swipeDeleted = false
         var lastCursorX = downX
         var repeats = 0
         val longPress = Runnable { onLongPress(this) }
@@ -97,26 +113,30 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private fun computeRects() {
         if (width == 0) return
         val unit = (width - 2 * sidePad) / layout.units
+        val rp = rowPitch
+        val hg = hGap
+        val vg = vGap
         rects = layout.rows.mapIndexed { r, row ->
             val total = row.keys.sumOf { it.width.toDouble() }.toFloat()
             var x = sidePad + (layout.units - total) / 2f * unit
-            val top = topPad + r * rowPitch
+            val top = topPad + r * rp
             row.keys.map { k ->
-                val rect = RectF(x + hGap / 2, top + vGap / 2, x + k.width * unit - hGap / 2, top + rowPitch - vGap / 2)
+                val rect = RectF(x + hg / 2, top + vg / 2, x + k.width * unit - hg / 2, top + rp - vg / 2)
                 x += k.width * unit
                 rect
             }
         }
     }
 
-    // ---------------------------------------------------------------- drawing
-
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(theme.background)
         val pressed = touches.values.map { it.key }.toSet()
         layout.rows.forEachIndexed { r, row ->
+            val rowRects = rects.getOrNull(r) ?: return@forEachIndexed
             row.keys.forEachIndexed { i, key ->
-                if (key.type != KeyType.SPACER) drawKey(canvas, key, rects[r][i], key in pressed)
+                if (key.type != KeyType.SPACER && i < rowRects.size) {
+                    drawKey(canvas, key, rowRects[i], key in pressed)
+                }
             }
         }
     }
@@ -125,39 +145,63 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         val func = key.isFunctional
         val active = (key.type == KeyType.SHIFT && shift != ShiftState.OFF)
         val accentEnter = key.type == KeyType.ENTER && enterAccent
+        val rad = radius
         val bg = when {
-            accentEnter -> if (pressed) theme.funcKey else theme.accent
-            active -> theme.key
+            accentEnter -> if (pressed) theme.funcKeyPressed else theme.accent
+            active -> if (theme.isDark) theme.keyPressed else 0xFFFFFFFF.toInt()
             func -> if (pressed) theme.funcKeyPressed else theme.funcKey
             else -> if (pressed) theme.keyPressed else theme.key
         }
-        fill.color = theme.keyShadow
-        c.drawRoundRect(rc.left, rc.top + 1.2f * dp, rc.right, rc.bottom + 1.2f * dp, radius, radius, fill)
+        if (theme.keyShadow != 0) {
+            fill.color = theme.keyShadow
+            c.drawRoundRect(rc.left, rc.top + 1.1f * dp, rc.right, rc.bottom + 1.25f * dp, rad, rad, fill)
+        }
         fill.color = bg
-        c.drawRoundRect(rc, radius, radius, fill)
+        c.drawRoundRect(rc, rad, rad, fill)
 
-        val fg = if (accentEnter && !pressed) theme.accentText else theme.text
+        // Subtle spacebar pill indicator in borderless mode so spacebar stays unmistakable
+        if (!prefs.keyBorders && key.type == KeyType.SPACE && !pressed) {
+            fill.color = theme.funcKeyPressed
+            c.drawRoundRect(rc.left + 4 * dp, rc.top + 4 * dp, rc.right - 4 * dp, rc.bottom - 4 * dp, rad, rad, fill)
+        }
+
+        val fg = if (accentEnter && !pressed) theme.accentText else if (active) theme.accent else theme.text
         val cx = rc.centerX()
         val cy = rc.centerY()
-        val u = minOf(sp, dp * 1.12f)
+        val u = minOf(sp, dp * 1.12f) * prefs.keyFontScale
+        // Isotropic 1:1 icon sizing — never squashed or stretched by height/width adjustments
+        val iconS = minOf(rc.width(), rc.height()) * 0.50f
         when (key.type) {
-            KeyType.SHIFT -> drawShift(c, cx, cy, 20 * dp, fg)
-            KeyType.DELETE -> drawDelete(c, cx, cy, 22 * dp, fg, pressed)
-            KeyType.EMOJI -> drawEmoji(c, cx, cy, 21 * dp, fg)
-            KeyType.LANG -> KeyDraw.drawLangBadge(c, rc, chinese, fg, text, dp, sp)
-            KeyType.ENTER -> KeyDraw.drawKeyText(c, enterLabel, rc, 15.2f * u, fg, text, dp, padH = 4 * dp, bold = accentEnter)
-            KeyType.SPACE -> KeyDraw.drawKeyText(c, key.label, rc, 15.0f * u, fg, text, dp)
+            KeyType.SHIFT -> drawShift(c, cx, cy, iconS.coerceIn(15 * dp, 20.5f * dp), fg)
+            KeyType.DELETE -> drawDelete(c, cx, cy, iconS.coerceIn(16 * dp, 21.5f * dp), fg, pressed)
+            KeyType.EMOJI -> drawEmoji(c, cx, cy, iconS.coerceIn(16 * dp, 20.5f * dp), fg)
+            KeyType.LANG -> KeyDraw.drawLangBadge(c, rc, chinese, fg, text, dp, sp * prefs.keyFontScale)
+            KeyType.ENTER -> KeyDraw.drawKeyText(c, enterLabel, rc, 14.8f * u, fg, text, dp, padH = 4 * dp, bold = accentEnter)
+            KeyType.SPACE -> KeyDraw.drawKeyText(c, key.label, rc, 14.2f * u, theme.textSecondary, text, dp)
             KeyType.TO_SYMBOLS, KeyType.TO_SYMBOLS2, KeyType.TO_LETTERS ->
-                KeyDraw.drawKeyText(c, key.label, rc, 15.0f * u, fg, text, dp, padH = 3.5f * dp)
-            KeyType.TEXT -> KeyDraw.drawKeyText(c, key.label, rc, 15.5f * u, fg, text, dp, padH = 3.5f * dp)
+                KeyDraw.drawKeyText(c, key.label, rc, 14.5f * u, fg, text, dp, padH = 3.5f * dp)
+            KeyType.TEXT -> KeyDraw.drawKeyText(c, key.label, rc, 15.0f * u, fg, text, dp, padH = 3.5f * dp)
             KeyType.CHAR -> {
                 val label = displayLabel(key)
-                val size = if (key.isLetter) 23.0f * u else if (label.length > 1) 15.5f * u else 21.5f * u
-                KeyDraw.drawKeyText(c, label, rc, size, fg, text, dp, padH = 2.5f * dp)
-                if (key.isLetter) hints[key.label[0]]?.let { h ->
+                val maxByHeight = (rc.height() * 0.54f).coerceAtLeast(12f * dp)
+                val baseSize = if (key.isLetter) 22.0f * u else if (label.length > 1) 15.0f * u else 20.5f * u
+                val size = minOf(baseSize, maxByHeight)
+                val hint = if (key.isLetter) hints[key.label[0]] else null
+                if (hint != null && rc.height() >= 30 * dp) {
+                    val shiftedRc = RectF(rc.left, rc.top + 2.2f * dp, rc.right, rc.bottom)
+                    KeyDraw.drawKeyText(c, label, shiftedRc, size, fg, text, dp, padH = 2.5f * dp)
                     text.textAlign = Paint.Align.RIGHT
-                    drawLabel(c, h, rc.right - 3.5f * dp, rc.top + 8.5f * dp, 10.0f * u, theme.textSecondary)
+                    drawLabel(
+                        c,
+                        hint,
+                        rc.right - 3.6f * dp,
+                        rc.top + 8.0f * dp,
+                        minOf(9.4f * u, rc.height() * 0.24f),
+                        theme.textSecondary,
+                    )
                     text.textAlign = Paint.Align.CENTER
+                } else {
+                    KeyDraw.drawKeyText(c, label, rc, size, fg, text, dp, padH = 2.5f * dp)
                 }
             }
             KeyType.SPACER -> Unit
@@ -226,17 +270,16 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         c.drawArc(cx - 0.25f * s, cy - 0.15f * s, cx + 0.25f * s, cy + 0.28f * s, 20f, 140f, false, stroke)
     }
 
-    // ---------------------------------------------------------------- touch
-
     private fun keyAt(x: Float, y: Float): Pair<Key, RectF>? {
         if (rects.isEmpty()) return null
         val r = ((y - topPad) / rowPitch).toInt().coerceIn(0, layout.rows.size - 1)
         val keys = layout.rows[r].keys
+        val rowRects = rects.getOrNull(r) ?: return null
         var best = -1
         var bestDist = Float.MAX_VALUE
         keys.forEachIndexed { i, k ->
-            if (k.type == KeyType.SPACER) return@forEachIndexed
-            val rc = rects[r][i]
+            if (k.type == KeyType.SPACER || i >= rowRects.size) return@forEachIndexed
+            val rc = rowRects[i]
             val d = when {
                 x < rc.left - hGap / 2 -> rc.left - x
                 x > rc.right + hGap / 2 -> x - rc.right
@@ -244,7 +287,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             }
             if (d < bestDist) { bestDist = d; best = i }
         }
-        return if (best < 0) null else keys[best] to rects[r][best]
+        return if (best < 0) null else keys[best] to rowRects[best]
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -252,7 +295,6 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val idx = e.actionIndex
-                // Rolling input: a new finger landing commits keys still held by other fingers.
                 for (t in touches.values.toList()) {
                     if (!t.longPressed && !t.cursorMode && (t.key.type == KeyType.CHAR || t.key.type == KeyType.TEXT)) {
                         release(t, commit = true)
@@ -282,6 +324,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     private fun press(t: Touch) {
         listener.onKeyDownFeedback(t.key)
+        val lpDelay = prefs.longPressMs.toLong()
         when (t.key.type) {
             KeyType.DELETE -> {
                 listener.onDeleteDown(false)
@@ -290,10 +333,10 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             KeyType.SHIFT -> listener.onFunction(t.key)
             KeyType.CHAR, KeyType.TEXT -> {
                 showPreview(t)
-                if (t.key.alts.isNotEmpty()) handler.postDelayed(t.longPress, 330)
+                if (t.key.alts.isNotEmpty()) handler.postDelayed(t.longPress, lpDelay)
             }
-            KeyType.SPACE -> handler.postDelayed(t.longPress, 450)
-            KeyType.LANG, KeyType.EMOJI -> handler.postDelayed(t.longPress, 450)
+            KeyType.SPACE -> if (prefs.spaceSwipeCursor) handler.postDelayed(t.longPress, 420)
+            KeyType.LANG, KeyType.EMOJI -> handler.postDelayed(t.longPress, 420)
             else -> Unit
         }
     }
@@ -304,26 +347,32 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 val i = previewOverlay?.altIndexAt(x, this) ?: 0
                 if (i != t.altIndex) { t.altIndex = i; previewOverlay?.setAltSelection(i) }
             }
-            t.key.type == KeyType.SPACE -> {
-                if (!t.cursorMode && abs(x - t.downX) > 14 * dp) {
+            t.key.type == KeyType.DELETE && prefs.swipeDeleteWord -> {
+                if (!t.swipeDeleted && t.repeats == 0 && (t.downX - x) > 28 * dp) {
+                    t.swipeDeleted = true
+                    handler.removeCallbacks(t.repeat)
+                    listener.onSwipeDeleteWord()
+                }
+            }
+            t.key.type == KeyType.SPACE && prefs.spaceSwipeCursor -> {
+                if (!t.cursorMode && abs(x - t.downX) > 13 * dp) {
                     t.cursorMode = true
                     t.lastCursorX = x
                     handler.removeCallbacks(t.longPress)
                 }
                 if (t.cursorMode) {
-                    val step = 11 * dp
+                    val step = 10.5f * dp
                     val steps = ((x - t.lastCursorX) / step).toInt()
                     if (steps != 0) { listener.onCursorMove(steps); t.lastCursorX += steps * step }
                 }
             }
             t.key.type == KeyType.CHAR || t.key.type == KeyType.TEXT -> {
-                // Sliding onto a neighbouring key retargets the press (commit happens on release).
                 val hit = keyAt(x, y) ?: return
                 if (hit.first !== t.key && (hit.first.type == KeyType.CHAR || hit.first.type == KeyType.TEXT)) {
                     handler.removeCallbacks(t.longPress)
                     t.key = hit.first; t.rect = hit.second
                     showPreview(t)
-                    if (t.key.alts.isNotEmpty()) handler.postDelayed(t.longPress, 330)
+                    if (t.key.alts.isNotEmpty()) handler.postDelayed(t.longPress, prefs.longPressMs.toLong())
                 }
             }
         }
@@ -339,8 +388,10 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 previewOverlay?.showAlts(t.alts, t.rect, this)
             }
             KeyType.SPACE -> {
-                t.cursorMode = true // iOS-style trackpad: hold space, then slide
-                listener.onKeyDownFeedback(t.key)
+                if (prefs.spaceSwipeCursor) {
+                    t.cursorMode = true
+                    listener.onKeyDownFeedback(t.key)
+                }
             }
             else -> {
                 t.longPressed = true
@@ -358,16 +409,15 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         when {
             t.longPressed && t.alts.isNotEmpty() -> listener.onText(t.key, t.alts[t.altIndex.coerceIn(0, t.alts.lastIndex)])
             t.longPressed -> Unit
-            t.cursorMode -> Unit
+            t.cursorMode || t.swipeDeleted -> Unit
             t.key.type == KeyType.CHAR || t.key.type == KeyType.TEXT -> listener.onText(t.key, if (t.key.isLetter) displayLabel(t.key) else t.key.text)
-            t.key.type == KeyType.DELETE || t.key.type == KeyType.SHIFT -> Unit // handled on down
+            t.key.type == KeyType.DELETE || t.key.type == KeyType.SHIFT -> Unit
             else -> listener.onFunction(t.key)
         }
     }
 
     private fun showPreview(t: Touch) {
-        // Previews only make sense for single glyph keys on full keyboards (not number pads).
-        if (t.key.width > 1.6f) { previewOverlay?.hide(); return }
+        if (!prefs.keyPreview || t.key.width > 1.6f) { previewOverlay?.hide(); return }
         previewOverlay?.showPreview(displayLabel(t.key), t.rect, this)
     }
 

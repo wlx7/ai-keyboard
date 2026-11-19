@@ -10,10 +10,9 @@ import android.view.MotionEvent
 import android.view.View
 
 /**
- * WeChat-Keyboard-inspired quick feature drawer opened from the single `[⊞]` button on the top bar.
- * Combines:
+ * Quick feature drawer opened from `[⊞]`:
  *   1) Input mode pill switcher (全拼 / 九宫格 / 双拼 / 手写 / 五笔·仓颉)
- *   2) 2×3 clean feature cards (剪贴板 / 语音输入 / 简繁切换 / 切换输入法 / 设置 / 收起键盘)
+ *   2) 2×4 sleek feature tiles (剪贴板 / 图片截图 / 语音输入 / 键盘大小 / 简繁切换 / 切换输入法 / 个性设置 / 收起键盘)
  *   3) Compact bottom text-editing strip (← / → / 全选 / 复制 / 粘贴 / ⌫)
  */
 @SuppressLint("ViewConstructor")
@@ -21,7 +20,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
 
     enum class InputMode { QUANPIN, T9, SHUANGPIN, HANDWRITING, SHAPE }
     enum class EditAction { LEFT, RIGHT, SELECT_ALL, COPY, PASTE, DELETE }
-    enum class Tile { CLIPBOARD, VOICE, TRADITIONAL, SWITCH_IME, SETTINGS, HIDE }
+    enum class Tile { CLIPBOARD, IMAGES, VOICE, RESIZE, TRADITIONAL, SWITCH_IME, SETTINGS, HIDE }
 
     interface Listener {
         fun onSelectInputMode(mode: InputMode)
@@ -51,7 +50,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
     private val tileRects = Array(tiles.size) { RectF() }
     private val editRects = Array(edits.size) { RectF() }
 
-    private var pressedGroup = 0 // 1=mode, 2=tile, 3=edit
+    private var pressedGroup = 0
     private var pressedIndex = -1
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -66,8 +65,8 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
         val side = 8 * dp
         val gap = 6 * dp
         val topY = 6 * dp
-        val modeH = (h * 0.165f).coerceIn(32 * dp, 40 * dp)
-        val editH = (h * 0.165f).coerceIn(32 * dp, 40 * dp)
+        val modeH = (h * 0.16f).coerceIn(31 * dp, 38 * dp)
+        val editH = (h * 0.155f).coerceIn(30 * dp, 37 * dp)
         val editTop = h - 5 * dp - editH
 
         // 1) Top input mode switcher pills
@@ -77,14 +76,14 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             modeRects[i].set(l, topY, l + mw, topY + modeH)
         }
 
-        // 2) Middle 2x3 feature cards
-        val gridTop = topY + modeH + 7 * dp
-        val gridBot = editTop - 7 * dp
-        val tileH = ((gridBot - gridTop - gap) / 2f).coerceAtLeast(36 * dp)
-        val tileW = (w - 2 * side - 2 * gap) / 3f
+        // 2) Middle 2x4 compact feature cards
+        val gridTop = topY + modeH + 6.5f * dp
+        val gridBot = editTop - 6.5f * dp
+        val tileH = ((gridBot - gridTop - gap) / 2f).coerceAtLeast(34 * dp)
+        val tileW = (w - 2 * side - 3 * gap) / 4f
         for (i in tiles.indices) {
-            val r = i / 3
-            val c = i % 3
+            val r = i / 4
+            val c = i % 4
             val l = side + c * (tileW + gap)
             val t = gridTop + r * (tileH + gap)
             tileRects[i].set(l, t, l + tileW, t + tileH)
@@ -121,63 +120,60 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
                 InputMode.SHAPE -> shapeLabel
             }
             val fg = if (selected) theme.accentText else theme.text
-            KeyDraw.drawKeyText(c, label, rc, 13.5f * u, fg, text, dp, padH = 5 * dp, bold = selected)
+            KeyDraw.drawKeyText(c, label, rc, 13.2f * u, fg, text, dp, padH = 5 * dp, bold = selected)
         }
 
-        // 2) Feature tiles (2x3)
+        // 2) Feature tiles (2x4 icon-above-label layout — crisp & never truncated!)
         tiles.forEachIndexed { i, tile ->
             val rc = tileRects[i]
             val down = pressedGroup == 2 && pressedIndex == i
-            fill.color = theme.keyShadow
-            c.drawRoundRect(rc.left, rc.top + 1f * dp, rc.right, rc.bottom + 1f * dp, 9 * dp, 9 * dp, fill)
+            if (theme.keyShadow != 0) {
+                fill.color = theme.keyShadow
+                c.drawRoundRect(rc.left, rc.top + 1f * dp, rc.right, rc.bottom + 1.1f * dp, 10 * dp, 10 * dp, fill)
+            }
             fill.color = if (down) theme.keyPressed else theme.key
-            c.drawRoundRect(rc, 9 * dp, 9 * dp, fill)
+            c.drawRoundRect(rc, 10 * dp, 10 * dp, fill)
 
-            val iconX = rc.left + 21 * dp
-            val cy = rc.centerY()
+            val cx = rc.centerX()
+            val iconY = rc.top + rc.height() * 0.37f
+            val labelY = rc.top + rc.height() * 0.78f
             val iconColor = if (tile == Tile.TRADITIONAL && traditional) theme.accent else theme.text
 
             when (tile) {
-                Tile.CLIPBOARD -> KeyDraw.drawClipboardIcon(c, iconX, cy, 20 * dp, iconColor, stroke, dp)
-                Tile.VOICE -> KeyDraw.drawMicIcon(c, iconX, cy, 20 * dp, iconColor, stroke, dp)
+                Tile.CLIPBOARD -> KeyDraw.drawClipboardIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
+                Tile.IMAGES -> KeyDraw.drawImageIcon(c, cx, iconY, 18.5f * dp, iconColor, fill, stroke, path, dp)
+                Tile.VOICE -> KeyDraw.drawMicIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
+                Tile.RESIZE -> KeyDraw.drawResizeIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
                 Tile.TRADITIONAL -> {
+                    val bRc = RectF(cx - 9.5f * dp, iconY - 9.5f * dp, cx + 9.5f * dp, iconY + 9.5f * dp)
                     fill.color = if (traditional) theme.accent else theme.funcKey
-                    c.drawRoundRect(iconX - 10 * dp, cy - 10 * dp, iconX + 10 * dp, cy + 10 * dp, 5 * dp, 5 * dp, fill)
-                    val badgeRc = RectF(iconX - 10 * dp, cy - 10 * dp, iconX + 10 * dp, cy + 10 * dp)
+                    c.drawRoundRect(bRc, 5 * dp, 5 * dp, fill)
                     KeyDraw.drawKeyText(
-                        c, if (traditional) "繁" else "简", badgeRc, 12.5f * u,
-                        if (traditional) theme.accentText else theme.text, text, dp, padH = 1 * dp, bold = true
+                        c, if (traditional) "繁" else "简", bRc, 11.8f * u,
+                        if (traditional) theme.accentText else theme.text, text, dp, padH = 1 * dp, bold = true,
                     )
                 }
-                Tile.SWITCH_IME -> KeyDraw.drawGlobeIcon(c, iconX, cy, 20 * dp, iconColor, stroke, dp)
-                Tile.SETTINGS -> KeyDraw.drawGearIcon(c, iconX, cy, 20 * dp, iconColor, stroke, dp)
-                Tile.HIDE -> KeyDraw.drawChevron(c, iconX, cy, 6 * dp, 1, iconColor, stroke, dp)
+                Tile.SWITCH_IME -> KeyDraw.drawGlobeIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
+                Tile.SETTINGS -> KeyDraw.drawGearIcon(c, cx, iconY, 18.5f * dp, iconColor, stroke, dp)
+                Tile.HIDE -> KeyDraw.drawChevron(c, cx, iconY, 5.8f * dp, 1, iconColor, stroke, dp)
             }
 
-            val (title, sub) = when (tile) {
-                Tile.CLIPBOARD -> "剪贴板" to (if (clipCount > 0) "$clipCount 条 · 1h清理" else "1h自动清理")
-                Tile.VOICE -> "语音输入" to "离线优先"
-                Tile.TRADITIONAL -> (if (traditional) "繁体输出" else "简体输出") to (if (traditional) "已开启" else "点击切换")
-                Tile.SWITCH_IME -> "切换输入法" to "系统列表"
-                Tile.SETTINGS -> "设置" to "方案与模型"
-                Tile.HIDE -> "收起键盘" to "隐藏面板"
+            val title = when (tile) {
+                Tile.CLIPBOARD -> if (clipCount > 0) "剪贴板($clipCount)" else "剪贴板"
+                Tile.IMAGES -> "图片/截图"
+                Tile.VOICE -> "离线语音"
+                Tile.RESIZE -> "键盘大小"
+                Tile.TRADITIONAL -> if (traditional) "繁体已开" else "简繁切换"
+                Tile.SWITCH_IME -> "切换键盘"
+                Tile.SETTINGS -> "主题设置"
+                Tile.HIDE -> "收起键盘"
             }
-
-            val textLeft = rc.left + 36 * dp
-            val maxW = (rc.right - textLeft - 5 * dp).coerceAtLeast(20 * dp)
-            text.textAlign = Paint.Align.LEFT
-            text.isFakeBoldText = true
-            text.textSize = 13.2f * u
-            if (text.measureText(title) > maxW) text.textSize *= (maxW / text.measureText(title))
-            text.color = theme.text
-            c.drawText(title, textLeft, cy - 2.5f * dp, text)
-
-            text.isFakeBoldText = false
-            text.textSize = 10.5f * u
-            if (text.measureText(sub) > maxW) text.textSize *= (maxW / text.measureText(sub))
-            text.color = if (tile == Tile.TRADITIONAL && traditional) theme.accent else theme.textSecondary
-            c.drawText(sub, textLeft, cy + 12.5f * dp, text)
-            text.textAlign = Paint.Align.CENTER
+            val labelRc = RectF(rc.left + 3 * dp, labelY - 9 * dp, rc.right - 3 * dp, labelY + 9 * dp)
+            KeyDraw.drawKeyText(
+                c, title, labelRc, 11.8f * u,
+                if (tile == Tile.TRADITIONAL && traditional) theme.accent else theme.text,
+                text, dp, padH = 2 * dp, bold = tile == Tile.TRADITIONAL && traditional,
+            )
         }
 
         // 3) Quick edit strip
@@ -185,7 +181,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
             val rc = editRects[i]
             val down = pressedGroup == 3 && pressedIndex == i
             fill.color = if (down) theme.funcKeyPressed else theme.funcKey
-            c.drawRoundRect(rc, 6.5f * dp, 6.5f * dp, fill)
+            c.drawRoundRect(rc, 7.5f * dp, 7.5f * dp, fill)
             val label = when (act) {
                 EditAction.LEFT -> "←"
                 EditAction.RIGHT -> "→"
@@ -194,7 +190,7 @@ class ToolPanel(context: Context, private val listener: Listener) : View(context
                 EditAction.PASTE -> "粘贴"
                 EditAction.DELETE -> "⌫"
             }
-            KeyDraw.drawKeyText(c, label, rc, 13.5f * u, theme.text, text, dp, padH = 3 * dp)
+            KeyDraw.drawKeyText(c, label, rc, 13.2f * u, theme.text, text, dp, padH = 3 * dp)
         }
     }
 

@@ -3,63 +3,138 @@ package app.aikb.ime.engine
 import android.content.Context
 import android.util.Log
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import kotlin.math.ln
 
 /**
- * Re-ranks librime's sentence candidates with an on-device language model.
+ * Re-ranks librime's sentence & contextual 2-syllable candidates with an on-device language model.
  *
- * score(c) = log P_lm(c | text before cursor) − alpha · ln(1 + rimeRank(c)) + cacheBoost(c)
- *
- * Only candidates that spell the whole input (one character per syllable) compete; partial
- * candidates keep their place after them. `alpha` is how much librime's own order is trusted;
- * it adapts to the user: picking the AI's choice lowers it, picking librime's original first
- * choice raises it. The cache boost favours phrases typed earlier in this session (memory only).
+ * Supports BOTH:
+ *   1. Built-in APK asset model (`assets/models/zh-lm-builtin.gguf`, Lingxi-285M Q4_0) — works
+ *      out-of-the-box on first install with zero manual setup!
+ *   2. User-imported custom `.gguf` (`files/models/zh-lm.gguf`), which overrides the built-in model
+ *      when present and can be removed anytime to revert to the built-in model.
  */
 object AiRanker {
-    const val MODEL_NAME = "zh-lm.gguf"
+    const val USER_MODEL_NAME = "zh-lm.gguf"
+    const val BUILTIN_ASSET_PATH = "models/zh-lm-builtin.gguf"
+    const val BUILTIN_FILE_NAME = "zh-lm-builtin.gguf"
     private const val TAG = "AiRanker"
 
     /** Default weight of librime's order, tuned on tools/eval (see ROADMAP.md). */
     const val DEFAULT_ALPHA = 3.0f
 
     /** The AI must beat librime's first choice by this many nats before overriding it. */
-    @Volatile var margin = 1.0f
+    @Volatile var margin = 0.95f
     const val MIN_SYLLABLES = 3
+    const val MIN_CONTEXTUAL_SYLLABLES = 2
     private const val MIN_ALPHA = 0.5f
     private const val MAX_ALPHA = 8f
-    private const val MAX_CANDIDATES = 16
+    private const val MAX_CANDIDATES = 20
 
     @Volatile var alpha = DEFAULT_ALPHA
     @Volatile private var loaded = false
+    @Volatile private var loadedPath: String? = null
     @Volatile var failed = false
         private set
+    @Volatile private var cachedHasAsset: Boolean? = null
 
-    fun modelFile(context: Context) = File(context.filesDir, "models/$MODEL_NAME")
+    /** User-imported external GGUF file (optional override). */
+    fun modelFile(context: Context) = File(context.filesDir, "models/$USER_MODEL_NAME")
 
-    fun hasModel(context: Context) = modelFile(context).let { it.exists() && it.length() > 1_000_000 }
+    /** Extracted built-in GGUF file for zero-copy mmap by llama.cpp. */
+    fun builtinExtractedFile(context: Context) = File(context.filesDir, "models/$BUILTIN_FILE_NAME")
 
-    /** Loads the model (blocking, ~0.5 s with mmap); call off the UI thread. */
+    fun hasUserModel(context: Context): Boolean =
+        modelFile(context).let { it.exists() && it.length() > 1_000_000 }
+
+    fun hasBuiltinModel(context: Context): Boolean {
+        cachedHasAsset?.let { return it }
+        val ok = runCatching {
+            context.assets.list("models")?.contains(BUILTIN_FILE_NAME) == true
+        }.getOrDefault(false) || builtinExtractedFile(context).let { it.exists() && it.length() > 1_000_000 }
+        cachedHasAsset = ok
+        return ok
+    }
+
+    fun hasModel(context: Context): Boolean = hasUserModel(context) || hasBuiltinModel(context)
+
+    /** Resolves the active GGUF file on disk (extracting the built-in asset once if needed). */
+    private fun resolveActiveModelFile(context: Context): File? {
+        val user = modelFile(context)
+        if (user.exists() && user.length() > 1_000_000) return user
+        if (!hasBuiltinModel(context)) return null
+        val dst = builtinExtractedFile(context)
+        val expectedLen = runCatching {
+            context.assets.openFd(BUILTIN_ASSET_PATH).use { it.length }
+        }.getOrDefault(-1L)
+        if (dst.exists() && dst.length() > 1_000_000 && (expectedLen <= 0L || dst.length() == expectedLen)) {
+            return dst
+        }
+        return runCatching {
+            dst.parentFile?.mkdirs()
+            val tmp = File(dst.path + ".tmp")
+            context.assets.open(BUILTIN_ASSET_PATH).use { input ->
+                tmp.outputStream().use { out -> input.copyTo(out, 1 shl 20) }
+            }
+            Files.move(tmp.toPath(), dst.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            dst
+        }.onFailure { Log.e(TAG, "Failed extracting built-in AI model", it) }.getOrNull()
+    }
+
+    /** Loads the model (blocking, ~0.4 s with mmap); call off the UI thread. */
     @Synchronized fun ensureLoaded(context: Context, threadsOverride: Int = 0): Boolean {
-        if (loaded) return true
-        if (failed || !hasModel(context)) return false
+        val target = resolveActiveModelFile(context) ?: return false
+        if (loaded && loadedPath == target.absolutePath) return true
+        if (loaded) { Llm.nativeFree(); loaded = false; loadedPath = null }
+        if (failed) return false
         val threads = if (threadsOverride > 0) threadsOverride else Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
-        loaded = runCatching { Llm.nativeLoad(modelFile(context).absolutePath, threads) }
+        loaded = runCatching { Llm.nativeLoad(target.absolutePath, threads) }
             .onFailure { Log.e(TAG, "load failed", it) }.getOrDefault(false)
-        if (!loaded) failed = true
+        if (loaded) loadedPath = target.absolutePath else failed = true
         return loaded
+    }
+
+    /** Resets failure state when a new model is imported or switched. */
+    @Synchronized fun resetAndUnload() {
+        if (loaded) { Llm.nativeFree(); loaded = false }
+        loadedPath = null
+        failed = false
     }
 
     /** Stops a running evaluation (new keystroke); cheap, any thread. */
     fun abort() { if (loaded) Llm.nativeAbort() }
 
     @Synchronized fun unload() {
-        if (loaded) { Llm.nativeFree(); loaded = false }
+        if (loaded) { Llm.nativeFree(); loaded = false; loadedPath = null }
     }
 
     fun syllableCount(spelled: String): Int = spelled.split(' ', '\'').count { it.isNotBlank() }
 
-    private fun isFullHan(s: String, n: Int): Boolean =
-        s.codePointCount(0, s.length) == n && s.all { it in '㐀'..'鿿' }
+    private fun hasCjkContext(context: String): Boolean {
+        var i = 0
+        while (i < context.length) {
+            val cp = context.codePointAt(i)
+            if (cp in 0x3400..0x9FFF || cp in 0x20000..0x323AF) return true
+            i += Character.charCount(cp)
+        }
+        return false
+    }
+
+    fun minRequiredSyllables(context: String): Int =
+        if (hasCjkContext(context)) MIN_CONTEXTUAL_SYLLABLES else MIN_SYLLABLES
+
+    private fun isFullHan(s: String, n: Int): Boolean {
+        if (s.codePointCount(0, s.length) != n) return false
+        var i = 0
+        while (i < s.length) {
+            val cp = s.codePointAt(i)
+            if (!(cp in 0x3400..0x9FFF || cp in 0xF900..0xFAFF || cp in 0x20000..0x323AF)) return false
+            i += Character.charCount(cp)
+        }
+        return true
+    }
 
     /** Indices (in librime order) of candidates that cover the whole input. */
     fun coverage(candidates: List<String>, syllables: Int): List<Int> =
@@ -72,7 +147,7 @@ object AiRanker {
         if (!loaded || syllables < 2) return null
         val idx = coverage(candidates, syllables)
         if (idx.size < 2) return null
-        val lm = Llm.nativeScore(context.takeLast(48), Array(idx.size) { candidates[idx[it]] }) ?: return null
+        val lm = Llm.nativeScore(context.takeLast(56), Array(idx.size) { candidates[idx[it]] }) ?: return null
         return Scored(idx, lm)
     }
 
@@ -84,7 +159,6 @@ object AiRanker {
             val score = s.lm[rank] - a * ln(1f + rank) + (if (useCache) cacheBoost(candidates[i]) else 0f)
             if (score > bestScore) { bestScore = score; best = i }
         }
-        // Keep librime's choice unless the LM is clearly more confident.
         val first = s.indices[0]
         val firstScore = s.lm[0] + (if (useCache) cacheBoost(candidates[first]) else 0f)
         return if (best != first && bestScore - firstScore < m) first else best
@@ -94,24 +168,38 @@ object AiRanker {
     fun supports(schema: String?): Boolean =
         schema != null && (schema == "rime_ice" || schema == "t9" || schema.startsWith("double_pinyin"))
 
-    class Suggestion(val text: String, val alternatives: List<String>)
+    class Suggestion(val text: String, val runnerUp: String?, val alternatives: List<String>)
 
     /**
-     * Explores sentence alternatives with librime and lets the LM pick. Returns null when the
-     * AI agrees with librime (or cannot help). Runs on a background thread.
+     * Explores sentence & contextual homophone alternatives with librime and lets the LM pick.
+     * Returns null when the AI agrees with librime (or cannot help). Runs on a background thread.
      */
     fun suggest(context: String, schema: String, input: String, syllables: Int, stale: () -> Boolean = { false }): Suggestion? {
-        if (!loaded || syllables < MIN_SYLLABLES || !supports(schema)) return null
+        val minSyl = minRequiredSyllables(context)
+        if (!loaded || syllables < minSyl || !supports(schema)) return null
         val t0 = android.os.SystemClock.elapsedRealtime()
         val alts = RimeEngine.alternatives(schema, input, syllables)
-        if (stale()) return null // the user kept typing while librime explored
+        if (stale()) return null
         val s = scoreRaw(context, alts, syllables)
-        val top = s?.let { best(it, alts) }
-        // Never log candidate text: it is what the user is typing.
+        val effMargin = if (syllables == 2) 0.85f else margin
+        val top = s?.let { best(it, alts, m = effMargin) }
         Log.d(TAG, "suggest syl=$syllables alts=${alts.size} scored=${s?.indices?.size} changed=${s != null && top != s.indices[0]} " +
             "in ${android.os.SystemClock.elapsedRealtime() - t0} ms")
         if (s == null || top == null || top == s.indices[0]) return null
-        return Suggestion(alts[top], alts)
+
+        // Also surface second-best distinct AI sentence if significantly stronger than default
+        var second: String? = null
+        var secondScore = Float.NEGATIVE_INFINITY
+        val firstScore = s.lm[0] + cacheBoost(alts[s.indices[0]])
+        s.indices.forEachIndexed { rank, idx ->
+            if (idx == top || idx == s.indices[0]) return@forEachIndexed
+            val sc = s.lm[rank] - alpha * ln(1f + rank) + cacheBoost(alts[idx])
+            if (sc > secondScore && sc - firstScore >= effMargin) {
+                secondScore = sc
+                second = alts[idx]
+            }
+        }
+        return Suggestion(alts[top], second, alts)
     }
 
     // ------------------------------------------------------------ adaptation

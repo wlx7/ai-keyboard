@@ -48,10 +48,35 @@ object Layouts {
         "z" to listOf("ž", "ź", "ż"),
     )
 
-    private fun letterRow(chars: String, digits: Boolean): List<Key> = chars.mapIndexed { i, c ->
+    private val letterSymbolZh = mapOf(
+        'q' to "1", 'w' to "2", 'e' to "3", 'r' to "4", 't' to "5",
+        'y' to "6", 'u' to "7", 'i' to "8", 'o' to "9", 'p' to "0",
+        'a' to "@", 's' to "#", 'd' to "¥", 'f' to "%", 'g' to "&",
+        'h' to "-", 'j' to "+", 'k' to "（", 'l' to "）",
+        'z' to "*", 'x' to "“", 'c' to "”", 'v' to "：", 'b' to "；", 'n' to "！", 'm' to "？",
+    )
+
+    private val letterSymbolEn = mapOf(
+        'q' to "1", 'w' to "2", 'e' to "3", 'r' to "4", 't' to "5",
+        'y' to "6", 'u' to "7", 'i' to "8", 'o' to "9", 'p' to "0",
+        'a' to "@", 's' to "#", 'd' to "$", 'f' to "%", 'g' to "&",
+        'h' to "-", 'j' to "+", 'k' to "(", 'l' to ")",
+        'z' to "*", 'x' to "\"", 'c' to "'", 'v' to ":", 'b' to ";", 'n' to "!", 'm' to "?",
+    )
+
+    /** Primary long-press symbol hint shown in the top-right corner of letter keys when enabled. */
+    fun symbolHints(chinese: Boolean, hasNumberRow: Boolean): Map<Char, String> {
+        val src = if (chinese) letterSymbolZh else letterSymbolEn
+        return if (!hasNumberRow) src else src.filterKeys { it !in "qwertyuiop" }
+    }
+
+    private fun letterRow(chars: String, chinese: Boolean): List<Key> = chars.map { c ->
         val s = c.toString()
         val alt = mutableListOf<String>()
-        if (digits) alt += ((i + 1) % 10).toString()
+        val sym = (if (chinese) letterSymbolZh else letterSymbolEn)[c]
+        if (sym != null) alt += sym
+        val enSym = letterSymbolEn[c]
+        if (enSym != null && enSym != sym) alt += enSym
         alt += accents[s].orEmpty()
         Key(KeyType.CHAR, s, s, 1f, alt)
     }
@@ -67,7 +92,6 @@ object Layouts {
         val emoji = Key(KeyType.EMOJI, "emoji", width = 1.12f)
         val enter = Key(KeyType.ENTER, "", width = if (kind == BottomRow.TEXT) 1.75f else 2.0f)
         if (kind == BottomRow.TEXT && chinese && page == Page.LETTERS) {
-            // Chinese letters page: quick ，and 。 beside the space bar (long-press for ？！ etc.).
             return Row(listOf(
                 Key(KeyType.TO_SYMBOLS, "123", width = 1.15f),
                 Key(KeyType.EMOJI, "emoji", width = 1.05f),
@@ -115,13 +139,23 @@ object Layouts {
         }
     }
 
-    fun letters(kind: BottomRow, chinese: Boolean, spaceLabel: String? = null): Layout = Layout("letters", listOf(
-        Row(letterRow("qwertyuiop", digits = true)),
-        Row(listOf(Key(KeyType.SPACER, width = 0.5f)) + letterRow("asdfghjkl", false) + Key(KeyType.SPACER, width = 0.5f)),
-        Row(listOf(Key(KeyType.SHIFT, width = 1.4f), spacer) + letterRow("zxcvbnm", false) +
-            listOf(spacer, Key(KeyType.DELETE, width = 1.4f))),
-        bottom(kind, chinese, Page.LETTERS, spaceLabel),
-    ))
+    fun letters(
+        kind: BottomRow,
+        chinese: Boolean,
+        spaceLabel: String? = null,
+        numberRow: Boolean = false,
+    ): Layout {
+        val rows = ArrayList<Row>(5)
+        if (numberRow) {
+            rows += Row(chars("1 2 3 4 5 6 7 8 9 0", alts = if (chinese) symAltsZh else symAltsEn))
+        }
+        rows += Row(letterRow("qwertyuiop", chinese))
+        rows += Row(listOf(Key(KeyType.SPACER, width = 0.5f)) + letterRow("asdfghjkl", chinese) + Key(KeyType.SPACER, width = 0.5f))
+        rows += Row(listOf(Key(KeyType.SHIFT, width = 1.4f), spacer) + letterRow("zxcvbnm", chinese) +
+            listOf(spacer, Key(KeyType.DELETE, width = 1.4f)))
+        rows += bottom(kind, chinese, Page.LETTERS, spaceLabel)
+        return Layout(if (numberRow) "letters_num" else "letters", rows)
+    }
 
     private val symAltsEn = mapOf(
         "-" to listOf("–", "—", "•"), "$" to listOf("€", "£", "¥", "₩", "₽", "¢"),

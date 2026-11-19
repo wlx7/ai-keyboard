@@ -22,7 +22,22 @@ std::mutex g_lock;
 std::atomic<bool> g_abortExplore{false};
 RimeApi* g_api = nullptr;
 RimeSessionId g_session = 0;
+RimeSessionId g_explore = 0;
 bool g_initialized = false;
+std::string g_pendingCommit;
+
+size_t utf8Len(const char* s) {
+    size_t n = 0;
+    for (; s && *s; ++s) if ((static_cast<unsigned char>(*s) & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+std::string trimSpaces(const std::string& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == ' ' || s[a] == '\'')) ++a;
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\'')) --b;
+    return s.substr(a, b - a);
+}
 
 // Proper UTF-8 -> UTF-16. NewStringUTF expects *modified* UTF-8 and aborts under CheckJNI on
 // 4-byte sequences, which rime produces for emoji candidates.
@@ -96,8 +111,10 @@ JNI_FN(jboolean, nativeStart)(JNIEnv* env, jobject, jstring shared, jstring user
     std::string sharedDir = fromJava(env, shared);
     std::string userDir = fromJava(env, user);
     std::string logs = fromJava(env, logDir);
+    g_pendingCommit.clear();
     if (g_initialized) {
         if (g_session) { g_api->destroy_session(g_session); g_session = 0; }
+        if (g_explore) { g_api->destroy_session(g_explore); g_explore = 0; }
         g_api->finalize();
         g_initialized = false;
     }
@@ -123,8 +140,10 @@ JNI_FN(jboolean, nativeStart)(JNIEnv* env, jobject, jstring shared, jstring user
 
 JNI_FN(void, nativeFinalize)(JNIEnv*, jobject) {
     std::lock_guard<std::mutex> lock(g_lock);
+    g_pendingCommit.clear();
     if (!g_initialized) return;
     if (g_session) { g_api->destroy_session(g_session); g_session = 0; }
+    if (g_explore) { g_api->destroy_session(g_explore); g_explore = 0; }
     g_api->finalize();
     g_initialized = false;
 }
@@ -133,11 +152,32 @@ JNI_FN(jboolean, nativeProcessKey)(JNIEnv*, jobject, jint keycode, jint mask) {
     g_abortExplore = true;
     std::lock_guard<std::mutex> lock(g_lock);
     if (!ensureSession()) return JNI_FALSE;
+    // Defensive guard: if BackSpace is pressed while a prefix segment was somehow left confirmed
+    // inside Rime composition, never reopen the confirmed Hanzi back into raw Pinyin!
+    if (keycode == 0xff08 && mask == 0) {
+        RIME_STRUCT(RimeContext, ctx);
+        if (g_api->get_context(g_session, &ctx)) {
+            int selStart = ctx.composition.sel_start;
+            int selEnd = ctx.composition.sel_end;
+            std::string pre = ctx.composition.preedit ? ctx.composition.preedit : "";
+            g_api->free_context(&ctx);
+            if (selStart > 0 && selStart <= static_cast<int>(pre.size()) && selEnd <= selStart) {
+                g_pendingCommit = trimSpaces(pre.substr(0, selStart));
+                g_api->clear_composition(g_session);
+                return JNI_TRUE;
+            }
+        }
+    }
     return g_api->process_key(g_session, keycode, mask) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNI_FN(jstring, nativeGetCommit)(JNIEnv* env, jobject) {
     std::lock_guard<std::mutex> lock(g_lock);
+    if (!g_pendingCommit.empty()) {
+        jstring r = toJava(env, g_pendingCommit.c_str());
+        g_pendingCommit.clear();
+        return r;
+    }
     if (!ensureSession()) return nullptr;
     RIME_STRUCT(RimeCommit, commit);
     if (!g_api->get_commit(g_session, &commit)) return nullptr;
@@ -185,7 +225,94 @@ JNI_FN(jboolean, nativeSelectCandidate)(JNIEnv*, jobject, jint index) {
     g_abortExplore = true;
     std::lock_guard<std::mutex> lock(g_lock);
     if (!ensureSession()) return JNI_FALSE;
-    return g_api->select_candidate(g_session, static_cast<size_t>(index)) ? JNI_TRUE : JNI_FALSE;
+    const char* rawBefore = g_api->get_input(g_session);
+    std::string fullInput = rawBefore ? rawBefore : "";
+    if (!g_api->select_candidate(g_session, static_cast<size_t>(index))) return JNI_FALSE;
+
+    // 1) Did Rime finish the entire composition?
+    RIME_STRUCT(RimeCommit, commit);
+    if (g_api->get_commit(g_session, &commit)) {
+        if (commit.text) g_pendingCommit = commit.text;
+        g_api->free_commit(&commit);
+        return JNI_TRUE;
+    }
+
+    // 2) Partial candidate selection (e.g. "qiushuishizhi" -> user tapped "秋水"):
+    //    Immediately commit "秋水" and keep ONLY the remaining raw input ("shizhi") composing,
+    //    so pressing Backspace NEVER reverts "秋水" back into raw pinyin "qiushui", AND the AI
+    //    model immediately receives "秋水" as committed prefix context!
+    RIME_STRUCT(RimeContext, ctx);
+    if (!g_api->get_context(g_session, &ctx)) return JNI_TRUE;
+    int selStart = ctx.composition.sel_start;
+    std::string pre = ctx.composition.preedit ? ctx.composition.preedit : "";
+    std::string fullPreview = ctx.commit_text_preview ? ctx.commit_text_preview : "";
+    g_api->free_context(&ctx);
+
+    if (selStart > 0 && selStart <= static_cast<int>(pre.size()) && fullInput.size() >= 2) {
+        std::string confirmedPrefix = trimSpaces(pre.substr(0, selStart));
+        std::string unconvPreedit = trimSpaces(pre.substr(selStart));
+        std::string expectedTailPreview;
+        if (fullPreview.size() > confirmedPrefix.size() &&
+            fullPreview.compare(0, confirmedPrefix.size(), confirmedPrefix) == 0) {
+            expectedTailPreview = fullPreview.substr(confirmedPrefix.size());
+        }
+
+        if (!confirmedPrefix.empty() && !unconvPreedit.empty()) {
+            if (!g_explore || !g_api->find_session(g_explore)) g_explore = g_api->create_session();
+            char sessSch[128] = {0}, expSch[128] = {0};
+            if (g_api->get_current_schema(g_session, sessSch, sizeof(sessSch))) {
+                if (!g_api->get_current_schema(g_explore, expSch, sizeof(expSch)) || std::string(sessSch) != expSch)
+                    g_api->select_schema(g_explore, sessSch);
+            }
+            for (const char* opt : {"traditionalization", "zh_trad", "simplification"}) {
+                g_api->set_option(g_explore, opt, g_api->get_option(g_session, opt));
+            }
+
+            size_t nonSpaceTail = 0;
+            for (char ch : unconvPreedit) if (ch != ' ') ++nonSpaceTail;
+            std::vector<size_t> candidatesCut;
+            if (nonSpaceTail > 0 && nonSpaceTail < fullInput.size())
+                candidatesCut.push_back(fullInput.size() - nonSpaceTail);
+            size_t dpCut = utf8Len(confirmedPrefix.c_str()) * 2;
+            if (dpCut > 0 && dpCut < fullInput.size())
+                candidatesCut.push_back(dpCut);
+            for (size_t k = 1; k < fullInput.size(); ++k) candidatesCut.push_back(k);
+
+            size_t matchedCut = 0;
+            for (size_t cut : candidatesCut) {
+                if (cut == 0 || cut >= fullInput.size()) continue;
+                std::string tail = fullInput.substr(cut);
+                g_api->clear_composition(g_explore);
+                if (!g_api->set_input(g_explore, tail.c_str())) {
+                    for (unsigned char c : tail) g_api->process_key(g_explore, c, 0);
+                }
+                RIME_STRUCT(RimeContext, ectx);
+                bool match = false;
+                if (g_api->get_context(g_explore, &ectx)) {
+                    std::string ePre = trimSpaces(ectx.composition.preedit ? ectx.composition.preedit : "");
+                    std::string ePrev = ectx.commit_text_preview ? ectx.commit_text_preview : "";
+                    if (ePre == unconvPreedit || (!expectedTailPreview.empty() && ePrev == expectedTailPreview)) {
+                        match = true;
+                    }
+                    g_api->free_context(&ectx);
+                }
+                if (match) { matchedCut = cut; break; }
+            }
+            g_api->clear_composition(g_explore);
+            RIME_STRUCT(RimeCommit, stale);
+            if (g_api->get_commit(g_explore, &stale)) g_api->free_commit(&stale);
+
+            if (matchedCut > 0 && matchedCut < fullInput.size()) {
+                std::string rem = fullInput.substr(matchedCut);
+                g_pendingCommit = confirmedPrefix;
+                g_api->clear_composition(g_session);
+                if (!g_api->set_input(g_session, rem.c_str())) {
+                    for (unsigned char c : rem) g_api->process_key(g_session, c, 0);
+                }
+            }
+        }
+    }
+    return JNI_TRUE;
 }
 
 JNI_FN(jboolean, nativeDeleteCandidate)(JNIEnv*, jobject, jint index) {
@@ -198,6 +325,7 @@ JNI_FN(jboolean, nativeDeleteCandidate)(JNIEnv*, jobject, jint index) {
 JNI_FN(void, nativeClearComposition)(JNIEnv*, jobject) {
     g_abortExplore = true;
     std::lock_guard<std::mutex> lock(g_lock);
+    g_pendingCommit.clear();
     if (ensureSession()) g_api->clear_composition(g_session);
 }
 
@@ -255,13 +383,6 @@ JNI_FN(jobjectArray, nativeSchemaList)(JNIEnv* env, jobject) {
 // never typed.
 
 namespace {
-RimeSessionId g_explore = 0;
-
-size_t utf8Len(const char* s) {
-    size_t n = 0;
-    for (; s && *s; ++s) if ((static_cast<unsigned char>(*s) & 0xC0) != 0x80) ++n;
-    return n;
-}
 
 std::vector<std::pair<std::string, size_t>> exploreCandidates(int k) {
     std::vector<std::pair<std::string, size_t>> out;
@@ -318,7 +439,7 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
         std::string in = fromJava(env, input);
         g_abortExplore = false;
         auto add = [&](const std::string& s) {
-            if (!s.empty() && out.size() < 20 && std::find(out.begin(), out.end(), s) == out.end())
+            if (!s.empty() && out.size() < 24 && std::find(out.begin(), out.end(), s) == out.end())
                 out.push_back(s);
         };
 
@@ -335,49 +456,51 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
         const std::string defaultSentence = explorePreview();
         add(defaultSentence);
 
-        // Walk along librime's top-choice spine from start to end of the sentence, branching at
-        // EVERY word boundary (not only the first two words) so mid- and end-of-sentence homophones
-        // (e.g. "预期/与其", "锁好/所好", "网上订/往上顶", "简洁/简介") enter the candidate pool.
         std::vector<size_t> spine;
         std::string prefixText;
         size_t covered = 0;
         const size_t totalSyl = static_cast<size_t>(std::max<jint>(syllables, 0));
 
-        for (int step = 0; step < 10 && covered < totalSyl && !g_abortExplore && out.size() < 20; ++step) {
+        for (int step = 0; step < 10 && covered < totalSyl && !g_abortExplore && out.size() < 24; ++step) {
             const size_t rem = totalSyl - covered;
-            const int branchLimit = (step == 0) ? std::max<int>(firstK, 4) : 3;
-            auto cands = exploreCandidates(branchLimit * 3 + 2);
+            const int branchLimit = (step == 0) ? std::max<int>(firstK, 6) : 4;
+            const int directLimit = (rem <= 3) ? 14 : 8;
+            auto cands = exploreCandidates(std::max(branchLimit * 3 + 4, directLimit + 4));
             if (cands.empty()) break;
 
             // Find spine choice (first partial/full word that fits remaining syllables, skipping index 0 full-sentence if step==0)
             int spineIdx = -1;
             for (size_t i = 0; i < cands.size(); ++i) {
                 const auto& [txt, len] = cands[i];
-                if (step == 0 && i == 0 && len == totalSyl && cands.size() > 1) continue; // sentence preview entry; pick word-level spine
+                if (step == 0 && i == 0 && len == totalSyl && cands.size() > 1) continue;
                 if (len > 0 && len <= rem) { spineIdx = static_cast<int>(i); break; }
             }
 
             // Explore alternative words at this segment position
             int branched = 0;
-            for (size_t i = 0; i < cands.size() && branched < branchLimit && !g_abortExplore; ++i) {
-                if (static_cast<int>(i) == spineIdx) continue;
+            int directAdded = 0;
+            for (size_t i = 0; i < cands.size() && !g_abortExplore && out.size() < 24; ++i) {
+                if (static_cast<int>(i) == spineIdx && !(cands[i].second == rem)) continue;
                 const auto& [txt, len] = cands[i];
                 if (len == 0 || len > rem) continue;
                 if (len == rem) {
-                    // Completes the rest of the sentence: read directly without selecting (never writes userdb!)
-                    add(prefixText + txt);
-                    ++branched;
+                    // Completes the rest of the sentence: read directly at zero extra decode cost!
+                    if (directAdded < directLimit) {
+                        add(prefixText + txt);
+                        ++directAdded;
+                    }
                     continue;
                 }
+                if (branched >= branchLimit) continue;
                 ++branched;
                 if (!g_api->select_candidate(g_explore, i)) continue;
                 const std::string branchSent = explorePreview();
                 add(branchSent);
 
                 // Look one more segment ahead for consecutive homophone pairs (e.g. "网上" + "订")
-                if (secondK > 0 && step < 4 && out.size() < 20) {
+                if (secondK > 0 && step < 4 && out.size() < 24) {
                     const size_t rem2 = rem - len;
-                    auto cands2 = exploreCandidates(secondK * 2 + 2);
+                    auto cands2 = exploreCandidates(secondK * 2 + 4);
                     int b2 = 0;
                     for (size_t j = 0; j < cands2.size() && b2 < secondK && !g_abortExplore; ++j) {
                         const auto& [t2, l2] = cands2[j];
@@ -405,6 +528,39 @@ JNI_FN(jobjectArray, nativeAlternatives)(JNIEnv* env, jobject, jstring schema, j
 
         g_api->clear_composition(g_explore);
         RIME_STRUCT(RimeCommit, commit); // defensive: never leave a commit pending
+        if (g_api->get_commit(g_explore, &commit)) g_api->free_commit(&commit);
+    }
+    std::vector<const char*> items;
+    for (auto& s : out) items.push_back(s.c_str());
+    return stringArray(env, items);
+}
+
+JNI_FN(jobjectArray, nativeQueryTop)(JNIEnv* env, jobject, jstring schema, jstring input, jint maxCands, jboolean traditional) {
+    std::lock_guard<std::mutex> lock(g_lock);
+    std::vector<std::string> out;
+    if (g_initialized) {
+        if (!g_explore || !g_api->find_session(g_explore)) g_explore = g_api->create_session();
+        std::string sch = fromJava(env, schema);
+        char cur[128] = {0};
+        if (!g_api->get_current_schema(g_explore, cur, sizeof(cur)) || sch != cur)
+            g_api->select_schema(g_explore, sch.c_str());
+        g_api->set_option(g_explore, "emoji", False);
+        g_api->set_option(g_explore, "traditionalization", traditional ? True : False);
+        std::string in = fromJava(env, input);
+        exploreFeed(in);
+
+        auto add = [&](const std::string& s) {
+            if (!s.empty() && static_cast<int>(out.size()) < maxCands && std::find(out.begin(), out.end(), s) == out.end())
+                out.push_back(s);
+        };
+        add(explorePreview());
+        auto cands = exploreCandidates(std::max<int>(maxCands * 2, 6));
+        for (const auto& [txt, len] : cands) {
+            if (len > 0) add(txt);
+            if (static_cast<int>(out.size()) >= maxCands) break;
+        }
+        g_api->clear_composition(g_explore);
+        RIME_STRUCT(RimeCommit, commit);
         if (g_api->get_commit(g_explore, &commit)) g_api->free_commit(&commit);
     }
     std::vector<const char*> items;

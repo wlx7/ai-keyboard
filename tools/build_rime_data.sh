@@ -13,6 +13,11 @@ mkdir -p "$OUT" && find "$OUT" -mindepth 1 -delete   # clear contents (the dir i
 ICE="$SRC/rime-ice"
 cp "$ICE"/default.yaml "$ICE"/symbols_v.yaml "$ICE"/symbols_caps_v.yaml "$ICE"/custom_phrase.txt "$OUT"/
 cp "$ICE"/rime_ice.schema.yaml "$ICE"/rime_ice.dict.yaml "$OUT"/
+# Enable full 41,448 rare-char table + sogou_cell 430k lexicon if present in cn_dicts
+sed -i 's/^  # - cn_dicts\/41448/  - cn_dicts\/41448/' "$OUT/rime_ice.dict.yaml"
+if [ -f "$ICE/cn_dicts/sogou_cell.dict.yaml" ] && ! grep -q "cn_dicts/sogou_cell" "$OUT/rime_ice.dict.yaml"; then
+  sed -i 's/^  - cn_dicts\/tencent/  - cn_dicts\/tencent\n  - cn_dicts\/sogou_cell/' "$OUT/rime_ice.dict.yaml"
+fi
 cp "$ICE"/double_pinyin*.schema.yaml "$OUT"/
 cp "$ICE"/melt_eng.schema.yaml "$ICE"/melt_eng.dict.yaml "$OUT"/
 cp "$ICE"/radical_pinyin.schema.yaml "$ICE"/radical_pinyin.dict.yaml "$OUT"/
