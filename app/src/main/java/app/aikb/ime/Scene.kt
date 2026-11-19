@@ -17,6 +17,8 @@ data class Scene(
     val learn: Boolean,         // allowed to learn typed words (never in passwords/incognito)
     val decimal: Boolean = false,
     val signed: Boolean = false,
+    val rawAction: Int = action,
+    val multiLine: Boolean = false,
 ) {
     val bottomRow: BottomRow
         get() = when (kind) {
@@ -51,7 +53,8 @@ data class Scene(
             val opts = info?.imeOptions ?: 0
             val multiLine = flags and InputType.TYPE_TEXT_FLAG_MULTI_LINE != 0
             val noEnterAction = opts and EditorInfo.IME_FLAG_NO_ENTER_ACTION != 0
-            var action = opts and EditorInfo.IME_MASK_ACTION
+            val rawAction = opts and EditorInfo.IME_MASK_ACTION
+            var action = rawAction
             if (noEnterAction || (multiLine && action == EditorInfo.IME_ACTION_UNSPECIFIED)) action = EditorInfo.IME_ACTION_NONE
             if (action == EditorInfo.IME_ACTION_UNSPECIFIED) action = EditorInfo.IME_ACTION_NONE
             val incognito = opts and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING != 0
@@ -61,11 +64,12 @@ data class Scene(
                     FieldKind.NUMBER, action, suggestions = false, autoCorrect = false, autoCaps = false, learn = false,
                     decimal = flags and InputType.TYPE_NUMBER_FLAG_DECIMAL != 0,
                     signed = flags and InputType.TYPE_NUMBER_FLAG_SIGNED != 0,
+                    rawAction = rawAction,
                 )
                 InputType.TYPE_CLASS_PHONE ->
-                    Scene(FieldKind.PHONE, action, false, false, false, false)
+                    Scene(FieldKind.PHONE, action, false, false, false, false, rawAction = rawAction)
                 InputType.TYPE_CLASS_DATETIME ->
-                    Scene(FieldKind.NUMBER, action, false, false, false, false, decimal = true)
+                    Scene(FieldKind.NUMBER, action, false, false, false, false, decimal = true, rawAction = rawAction)
                 else -> {
                     val noSuggest = flags and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS != 0
                     val caps = flags and (InputType.TYPE_TEXT_FLAG_CAP_SENTENCES or
@@ -73,19 +77,21 @@ data class Scene(
                     when (variation) {
                         InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS,
                         InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS ->
-                            Scene(FieldKind.EMAIL, action, true, false, false, !incognito)
+                            Scene(FieldKind.EMAIL, action, true, false, false, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_URI ->
-                            Scene(FieldKind.URL, action, true, false, false, false)
+                            Scene(FieldKind.URL, action, true, false, false, false, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_PASSWORD,
                         InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD,
                         InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ->
-                            Scene(FieldKind.PASSWORD, action, false, false, false, false)
+                            Scene(FieldKind.PASSWORD, action, false, false, false, false, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_PERSON_NAME ->
-                            Scene(FieldKind.PERSON_NAME, action, !noSuggest, false, true, !incognito)
+                            Scene(FieldKind.PERSON_NAME, action, !noSuggest, false, true, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_FILTER ->
-                            Scene(FieldKind.TEXT, action, !noSuggest, false, false, false)
-                        else -> Scene(FieldKind.TEXT, action, !noSuggest, autoCorrect = !noSuggest,
-                            autoCaps = caps, learn = !incognito)
+                            Scene(FieldKind.TEXT, action, !noSuggest, false, false, false, rawAction = rawAction, multiLine = multiLine)
+                        else -> Scene(
+                            FieldKind.TEXT, action, !noSuggest, autoCorrect = !noSuggest,
+                            autoCaps = caps, learn = !incognito, rawAction = rawAction, multiLine = multiLine,
+                        )
                     }
                 }
             }

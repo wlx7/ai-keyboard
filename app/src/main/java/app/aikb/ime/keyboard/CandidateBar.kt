@@ -30,6 +30,7 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
     enum class ToolbarAction {
         MENU, HANDWRITING_TOGGLE, CLIPBOARD, IMAGES,
+        PASTE_OTP, DISMISS_OTP,
         PASTE_FRESH, DISMISS_FRESH,
         SEND_FRESH_IMAGE, DISMISS_FRESH_IMAGE,
         VOICE, HIDE,
@@ -59,6 +60,12 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         set(v) { if (field != v) { field = v; invalidate() } }
 
     var freshClip: String? = null
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    var freshOtpCode: String? = null
+        set(v) { if (field != v) { field = v; invalidate() } }
+
+    var freshOtpSource: String? = null
         set(v) { if (field != v) { field = v; invalidate() } }
 
     var freshImageLabel: String? = null
@@ -248,10 +255,37 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
         val menuFg = if (menuActive) theme.accentText else theme.text
         KeyDraw.drawGridIcon(c, menuRect.centerX(), cy, 18f * dp, menuFg, fill, stroke, dp, active = menuActive)
 
-        // 2) Priority 1: Fresh Screenshot/Photo Chip -> Priority 2: Fresh Clipboard Chip -> Default Icons
+        // 2) Priority 0: Fresh OTP Code -> Priority 1: Fresh Screenshot/Photo -> Priority 2: Fresh Clipboard -> Default Icons
+        val otp = freshOtpCode
         val fImgLabel = freshImageLabel
         val fClip = freshClip
-        if (fImgLabel != null) {
+        if (otp != null) {
+            val maxChipRight = voiceRect.left - 6 * dp
+            val src = freshOtpSource?.takeIf { it.isNotBlank() } ?: "信息"
+            val preview = "🔑 $otp  · 来自「$src」"
+            paint.typeface = Typeface.DEFAULT_BOLD
+            paint.textSize = 13.0f * u
+            val availTextW = (maxChipRight - hwRect.left - 36 * dp).coerceAtLeast(48 * dp)
+            val shown = ellipsize(preview, availTextW)
+            val chipW = (paint.measureText(shown) + 36 * dp).coerceAtMost(maxChipRight - hwRect.left)
+            freshBubbleRect.set(hwRect.left, 5.5f * dp, hwRect.left + chipW, height - 5.5f * dp)
+            freshCloseRect.set(freshBubbleRect.right - 26 * dp, 5.5f * dp, freshBubbleRect.right, height - 5.5f * dp)
+
+            fill.color = if (pressedToolbar == ToolbarAction.PASTE_OTP) theme.keyPressed else theme.candidateHighlight
+            c.drawRoundRect(freshBubbleRect, 17 * dp, 17 * dp, fill)
+            stroke.color = (theme.accent and 0x00FFFFFF) or 0x77000000
+            stroke.strokeWidth = 1.2f * dp
+            c.drawRoundRect(freshBubbleRect, 17 * dp, 17 * dp, stroke)
+
+            paint.color = theme.accent
+            paint.textAlign = Paint.Align.LEFT
+            val fm = paint.fontMetrics
+            c.drawText(shown, freshBubbleRect.left + 11 * dp, cy - (fm.ascent + fm.descent) / 2f, paint)
+            paint.textAlign = Paint.Align.CENTER
+            paint.typeface = Typeface.DEFAULT
+
+            drawSmallCloseX(c, freshCloseRect.centerX(), cy)
+        } else if (fImgLabel != null) {
             val maxChipRight = voiceRect.left - 6 * dp
             paint.typeface = Typeface.DEFAULT_BOLD
             paint.textSize = 12.8f * u
@@ -413,7 +447,10 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
     private fun toolbarHit(x: Float, y: Float): ToolbarAction? {
         if (menuRect.contains(x, y)) return ToolbarAction.MENU
-        if (freshImageLabel != null) {
+        if (freshOtpCode != null) {
+            if (freshCloseRect.contains(x, y)) return ToolbarAction.DISMISS_OTP
+            if (freshBubbleRect.contains(x, y)) return ToolbarAction.PASTE_OTP
+        } else if (freshImageLabel != null) {
             if (freshCloseRect.contains(x, y)) return ToolbarAction.DISMISS_FRESH_IMAGE
             if (freshBubbleRect.contains(x, y)) return ToolbarAction.SEND_FRESH_IMAGE
         } else if (freshClip != null) {

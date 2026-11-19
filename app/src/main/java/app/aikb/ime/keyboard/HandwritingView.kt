@@ -67,6 +67,9 @@ class HandwritingView(context: Context, private val listener: Listener) : View(c
         set(v) { field = v; invalidate() }
     var hasPendingComposition = false
         set(v) { field = v; invalidate() }
+    /** Shows proportional calligraphy sample strokes in live settings preview when canvas is empty. */
+    var previewDemoMode = false
+        set(v) { field = v; invalidate() }
 
     private val padRect = RectF()
     private val undoBadgeRect = RectF()
@@ -234,6 +237,10 @@ class HandwritingView(context: Context, private val listener: Listener) : View(c
 
         val u = minOf(sp, dp * 1.12f) * prefs.keyFontScale
         if (strokes.isEmpty() && currentStroke == null) {
+            if (previewDemoMode) {
+                drawPreviewDemoSample(c, cx, cy, u)
+                return
+            }
             text.textSize = 14f * u
             text.color = (theme.textSecondary and 0x00FFFFFF) or 0x70000000
             val fm = text.fontMetrics
@@ -255,6 +262,28 @@ class HandwritingView(context: Context, private val listener: Listener) : View(c
             c.drawRoundRect(undoBadgeRect, 7 * dp, 7 * dp, fill)
             KeyDraw.drawKeyText(c, "↶", undoBadgeRect, 14f * u, theme.textSecondary, text, dp, padH = 2 * dp)
         }
+        c.restore()
+    }
+
+    private fun drawPreviewDemoSample(c: Canvas, cx: Float, cy: Float, u: Float) {
+        val box = minOf(padRect.width(), padRect.height()) * 0.35f
+        val oy = cy - 6f * dp
+        fun pt(nx: Float, ny: Float) = Point(cx + nx * box, oy + ny * box)
+        val demo = listOf(
+            listOf(pt(-0.08f, -0.78f), pt(0.04f, -0.68f), pt(0.11f, -0.58f)),
+            listOf(pt(-0.26f, -0.42f), pt(0.04f, -0.47f), pt(0.04f, 0.52f), pt(0.02f, 0.68f), pt(-0.15f, 0.55f)),
+            listOf(pt(-0.56f, -0.08f), pt(-0.24f, -0.15f), pt(-0.37f, 0.22f), pt(-0.62f, 0.50f)),
+            listOf(pt(0.48f, -0.26f), pt(0.28f, -0.06f), pt(0.11f, 0.06f)),
+            listOf(pt(0.09f, 0.02f), pt(0.35f, 0.31f), pt(0.64f, 0.54f)),
+        )
+        c.save()
+        c.clipRect(padRect)
+        inkPaint.strokeWidth = prefs.hwStrokeWidthDp * dp
+        inkPaint.color = theme.text
+        for (s in demo) drawSmoothStroke(c, s)
+        text.textSize = 11.5f * u
+        text.color = (theme.textSecondary and 0x00FFFFFF) or 0x88000000.toInt()
+        c.drawText("实时笔迹粗细与画布预览（也可直接在此试写）", cx, padRect.bottom - 9f * dp, text)
         c.restore()
     }
 

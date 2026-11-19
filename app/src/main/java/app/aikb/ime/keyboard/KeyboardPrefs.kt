@@ -4,8 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 
 /**
- * Centralized user personalization & ergonomic geometry preferences.
- * Read into an immutable snapshot for zero-allocation access during 120Hz Canvas drawing.
+ * Centralized user personalization, ergonomic geometry & auxiliary input preferences.
  */
 data class KeyboardPrefs(
     val themeId: String = "system",
@@ -28,6 +27,11 @@ data class KeyboardPrefs(
     val smartPinyinCorrect: Boolean = true,
     val autoCaps: Boolean = true,
     val doubleSpacePeriod: Boolean = true,
+    val enterToSend: Boolean = false,
+    val spaceCnNum: Boolean = false,
+    val spaceCnEn: Boolean = false,
+    val otpAutoFill: Boolean = true,
+    val postCommitPredict: Boolean = true,
     val spaceSwipeCursor: Boolean = true,
     val swipeDeleteWord: Boolean = true,
     val screenshotBubble: Boolean = true,
@@ -51,6 +55,11 @@ data class KeyboardPrefs(
         const val KEY_LONG_PRESS_MS = "long_press_ms"
         const val KEY_HAPTIC_MS = "haptic_strength_ms"
         const val KEY_SMART_PINYIN_CORRECT = "smart_pinyin_correct"
+        const val KEY_ENTER_TO_SEND = "enter_to_send"
+        const val KEY_SPACE_CN_NUM = "space_cn_num"
+        const val KEY_SPACE_CN_EN = "space_cn_en"
+        const val KEY_OTP_AUTOFILL = "otp_autofill"
+        const val KEY_POST_PREDICT = "post_commit_predict"
         const val KEY_SPACE_SWIPE = "space_swipe_cursor"
         const val KEY_SWIPE_DELETE = "swipe_delete_word"
         const val KEY_SCREENSHOT_BUBBLE = "screenshot_bubble"
@@ -62,8 +71,9 @@ data class KeyboardPrefs(
             KEY_THEME_ID, KEY_BORDERS, KEY_RADIUS_DP, KEY_HEIGHT_SCALE, KEY_WIDTH_RATIO,
             KEY_ONE_HAND_ALIGN, KEY_BOTTOM_OFFSET_DP, KEY_FONT_SCALE, KEY_CAND_FONT_SCALE,
             KEY_NUMBER_ROW, KEY_SHOW_HINTS, KEY_PREVIEW, KEY_LONG_PRESS_MS, KEY_HAPTIC_MS,
-            KEY_SMART_PINYIN_CORRECT, KEY_SPACE_SWIPE, KEY_SWIPE_DELETE, KEY_SCREENSHOT_BUBBLE,
-            KEY_HW_HEIGHT_SCALE, KEY_HW_STROKE_DP, KEY_HW_AUTOCOMMIT_MS,
+            KEY_SMART_PINYIN_CORRECT, KEY_ENTER_TO_SEND, KEY_SPACE_CN_NUM, KEY_SPACE_CN_EN,
+            KEY_OTP_AUTOFILL, KEY_POST_PREDICT, KEY_SPACE_SWIPE, KEY_SWIPE_DELETE,
+            KEY_SCREENSHOT_BUBBLE, KEY_HW_HEIGHT_SCALE, KEY_HW_STROKE_DP, KEY_HW_AUTOCOMMIT_MS,
             "haptics", "sound", "auto_correct", "auto_caps", "double_space",
         )
 
@@ -91,6 +101,11 @@ data class KeyboardPrefs(
             smartPinyinCorrect = p.getBoolean(KEY_SMART_PINYIN_CORRECT, true),
             autoCaps = p.getBoolean("auto_caps", true),
             doubleSpacePeriod = p.getBoolean("double_space", true),
+            enterToSend = p.getBoolean(KEY_ENTER_TO_SEND, false),
+            spaceCnNum = p.getBoolean(KEY_SPACE_CN_NUM, false),
+            spaceCnEn = p.getBoolean(KEY_SPACE_CN_EN, false),
+            otpAutoFill = p.getBoolean(KEY_OTP_AUTOFILL, true),
+            postCommitPredict = p.getBoolean(KEY_POST_PREDICT, true),
             spaceSwipeCursor = p.getBoolean(KEY_SPACE_SWIPE, true),
             swipeDeleteWord = p.getBoolean(KEY_SWIPE_DELETE, true),
             screenshotBubble = p.getBoolean(KEY_SCREENSHOT_BUBBLE, true),

@@ -23,18 +23,22 @@ import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InlineSuggestionsRequest
 import android.view.inputmethod.InlineSuggestionsResponse
+import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import androidx.annotation.RequiresApi
 import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.AutoSpacer
 import app.aikb.ime.engine.ChinesePredictor
 import app.aikb.ime.engine.ClipboardStore
+import app.aikb.ime.engine.EmojiPredictor
 import app.aikb.ime.engine.EnglishDictionary
 import app.aikb.ime.engine.EnglishEngine
 import app.aikb.ime.engine.EnglishResult
 import app.aikb.ime.engine.HandwritingEngine
 import app.aikb.ime.engine.OfflineAsrEngine
+import app.aikb.ime.engine.OtpStore
 import app.aikb.ime.engine.PinyinCorrector
 import app.aikb.ime.engine.RecentImageStore
 import app.aikb.ime.engine.Rime
@@ -135,6 +139,7 @@ class ImeService : InputMethodService(),
     private var lastEditAt = 0L
 
     private val uiHandler = Handler(Looper.getMainLooper())
+    private val otpListener: () -> Unit = { uiHandler.post { syncToolbarState() } }
     private val clipTick = object : Runnable {
         override fun run() {
             syncToolbarState()
@@ -156,6 +161,7 @@ class ImeService : InputMethodService(),
             val txt = clip.getItemAt(0).text?.toString()
             if (!txt.isNullOrBlank()) {
                 clipboardStore.onCopied(txt)
+                if (kbPrefs.otpAutoFill) OtpStore.onCandidateText(null, txt, "剪贴板")
                 if (::clipboardPanel.isInitialized && overlay == Overlay.CLIPBOARD) clipboardPanel.refresh()
                 syncToolbarState()
             }
@@ -218,6 +224,7 @@ class ImeService : InputMethodService(),
         }
         english = runCatching { EnglishEngine(EnglishDictionary.load(this), history) }.getOrNull()
         zhPredictor = runCatching { ChinesePredictor.load(this, filesDir.resolve("zh_user.tsv")) }.getOrNull()
+        OtpStore.addListener(otpListener)
         RimeEngine.addStateListener(rimeListener)
         RimeEngine.traditional = prefs.getBoolean(KEY_TRADITIONAL, false)
         AiRanker.alpha = prefs.getFloat(KEY_AI_ALPHA, AiRanker.DEFAULT_ALPHA)
@@ -229,6 +236,7 @@ class ImeService : InputMethodService(),
         prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         runCatching { sysClipboard?.removePrimaryClipChangedListener(clipListener) }
         recentImageStore.stopObserving()
+        OtpStore.removeListener(otpListener)
         RimeEngine.removeStateListener(rimeListener)
         OfflineAsrEngine.unload()
         aiWorker.shutdownNow()
@@ -484,6 +492,9 @@ class ImeService : InputMethodService(),
 
     private fun enterLabel(): Pair<String, Boolean> {
         val zh = chinese || page == Page.NUMBER || page == Page.PHONE || Locale.zh
+        if (kbPrefs.enterToSend && scene.kind == FieldKind.TEXT && scene.action == EditorInfo.IME_ACTION_NONE) {
+            return (if (zh) "发送" else "send") to true
+        }
         return when (scene.action) {
             EditorInfo.IME_ACTION_GO -> (if (zh) "前往" else "go") to true
             EditorInfo.IME_ACTION_SEARCH -> (if (zh) "搜索" else "search") to true
@@ -540,6 +551,10 @@ class ImeService : InputMethodService(),
         candidates.menuActive = overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.VOICE, Overlay.IMAGES, Overlay.RESIZE)
         candidates.hasClips = clipboardStore.hasAny()
         candidates.freshClip = if (scene.kind == FieldKind.PASSWORD) null else clipboardStore.freshClip()
+
+        val otp = if (kbPrefs.otpAutoFill) OtpStore.activeOtp() else null
+        candidates.freshOtpCode = otp?.code
+        candidates.freshOtpSource = otp?.source
 
         val freshImg = if (kbPrefs.screenshotBubble && scene.kind != FieldKind.PASSWORD) recentImageStore.activeFresh() else null
         candidates.freshImageLabel = freshImg?.first?.let { if (it.isScreenshot) "发送刚截的图" else "发送最新照片" }
@@ -643,6 +658,19 @@ class ImeService : InputMethodService(),
                 showNextPredictions = false; showZhPredictions = false
                 updateCandidates()
                 setOverlay(if (overlay == Overlay.IMAGES) Overlay.NONE else Overlay.IMAGES)
+            }
+            CandidateBar.ToolbarAction.PASTE_OTP -> {
+                val otp = OtpStore.activeOtp() ?: return
+                OtpStore.consumeOrDismiss()
+                if (zhComposing) { RimeEngine.clear(); zh = EMPTY_ZH }
+                if (composing.isNotEmpty()) { composing.clear(); result = null }
+                currentInputConnection?.commitText(otp.code, 1)
+                syncToolbarState()
+                updateCandidates()
+            }
+            CandidateBar.ToolbarAction.DISMISS_OTP -> {
+                OtpStore.consumeOrDismiss()
+                syncToolbarState()
             }
             CandidateBar.ToolbarAction.PASTE_FRESH -> {
                 val clip = clipboardStore.freshClip() ?: return
@@ -832,7 +860,7 @@ class ImeService : InputMethodService(),
         val ic = currentInputConnection ?: return
         ic.finishComposingText()
         val prevZh = trailingZhWordBeforeCursor()
-        ic.commitText(text, 1)
+        commitFormatted(ic, text)
         if (text.any(ChinesePredictor::isCjk)) {
             recordChineseCommit(prevZh, text)
             updateCandidates()
@@ -869,10 +897,26 @@ class ImeService : InputMethodService(),
         return before.substring(i).takeIf { it.isNotEmpty() }
     }
 
+    /** Commits [text] applying Pangu `spaceCnEn` / `spaceCnNum` spacing when enabled. */
+    private fun commitFormatted(ic: InputConnection?, text: String, skipBeforeLen: Int = 0) {
+        if (ic == null) return
+        if (text.isEmpty() || scene.kind != FieldKind.TEXT || (!kbPrefs.spaceCnEn && !kbPrefs.spaceCnNum)) {
+            ic.commitText(text, 1)
+            return
+        }
+        val raw = ic.getTextBeforeCursor(4 + skipBeforeLen, 0)?.toString().orEmpty()
+        val before = if (skipSuffixSafe(raw, skipBeforeLen)) raw.dropLast(skipBeforeLen) else raw
+        val formatted = AutoSpacer.formatCommit(before, text, kbPrefs.spaceCnEn, kbPrefs.spaceCnNum)
+        ic.commitText(formatted, 1)
+    }
+
+    private fun skipSuffixSafe(raw: String, skipLen: Int): Boolean =
+        skipLen > 0 && raw.length >= skipLen
+
     private fun recordChineseCommit(prevZh: String?, committed: String) {
         AiRanker.remember(committed)
         if (scene.learn) zhPredictor?.learn(prevZh, committed)
-        showZhPredictions = scene.suggestions && scene.kind != FieldKind.PASSWORD &&
+        showZhPredictions = kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD &&
             committed.isNotEmpty() && ChinesePredictor.isCjk(committed.last())
     }
 
@@ -922,6 +966,12 @@ class ImeService : InputMethodService(),
         val letterLike = text.length == 1 && (text[0].isLetter() || (text == "'" && composing.isNotEmpty()))
         val composes = page == Page.LETTERS && letterLike && usesComposing()
         if (composes) {
+            if (composing.isEmpty() && scene.kind == FieldKind.TEXT && (kbPrefs.spaceCnEn || kbPrefs.spaceCnNum)) {
+                val before = ic.getTextBeforeCursor(2, 0)
+                if (AutoSpacer.needsLeadingSpace(before, text[0], kbPrefs.spaceCnEn, kbPrefs.spaceCnNum)) {
+                    ic.commitText(" ", 1)
+                }
+            }
             composing.append(text)
             showNextPredictions = false
             showZhPredictions = false
@@ -932,7 +982,7 @@ class ImeService : InputMethodService(),
                 val punct = text.length == 1 && text[0] in ".,?!;:"
                 commitComposing(useAutoCorrect = punct)
             }
-            ic.commitText(text, 1)
+            commitFormatted(ic, text)
             showNextPredictions = false
             showZhPredictions = false
             if (shift == ShiftState.ONCE && page == Page.LETTERS) setShift(ShiftState.OFF)
@@ -976,8 +1026,22 @@ class ImeService : InputMethodService(),
                 if (hwComposing) { hwCommitTop(); return }
                 if (zhComposing) { zhCommitRaw(); return }
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-                if (scene.action != EditorInfo.IME_ACTION_NONE) ic?.performEditorAction(scene.action)
-                else sendKeyChar('\n')
+                if (scene.action != EditorInfo.IME_ACTION_NONE) {
+                    ic?.performEditorAction(scene.action)
+                } else if (kbPrefs.enterToSend && scene.kind == FieldKind.TEXT) {
+                    val act = scene.rawAction.takeIf {
+                        it in setOf(
+                            EditorInfo.IME_ACTION_SEND,
+                            EditorInfo.IME_ACTION_GO,
+                            EditorInfo.IME_ACTION_SEARCH,
+                            EditorInfo.IME_ACTION_DONE,
+                        )
+                    } ?: EditorInfo.IME_ACTION_SEND
+                    val handled = ic?.performEditorAction(act) == true
+                    if (!handled) sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                } else {
+                    sendKeyChar('\n')
+                }
                 updateAutoShift()
                 updateCandidates()
             }
@@ -1012,6 +1076,16 @@ class ImeService : InputMethodService(),
         when (key.type) {
             KeyType.LANG, KeyType.EMOJI ->
                 (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+            KeyType.ENTER -> {
+                if (hwComposing) hwCommitTop()
+                if (zhComposing) zhCommitRaw()
+                if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
+                showNextPredictions = false
+                showZhPredictions = false
+                sendKeyChar('\n')
+                updateAutoShift()
+                updateCandidates()
+            }
             else -> Unit
         }
     }
@@ -1043,23 +1117,31 @@ class ImeService : InputMethodService(),
                 val committed = commitComposing(useAutoCorrect = true)
                 ic.commitText(" ", 1)
                 if (committed != typed) lastAutoCorrect = typed to committed
-                showNextPredictions = scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)
+                showNextPredictions = kbPrefs.postCommitPredict && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)
             }
         } else {
             lastAutoCorrect = null
             val before = ic.getTextBeforeCursor(2, 0)?.toString().orEmpty()
-            if (kbPrefs.doubleSpacePeriod && !chinese && scene.kind == FieldKind.TEXT && now - lastSpaceAt < 450 && before.length == 2 &&
-                before[1] == ' ' && before[0].isLetterOrDigit()
-            ) {
-                ic.deleteSurroundingText(1, 0)
-                ic.commitText(". ", 1)
-                lastSpaceAt = 0
-                showNextPredictions = false
-                updateAutoShift(); updateCandidates()
-                return
+            if (kbPrefs.doubleSpacePeriod && scene.kind == FieldKind.TEXT && now - lastSpaceAt < 450 && before.length == 2 && before[1] == ' ') {
+                val prevCh = before[0]
+                if (chinese && (ChinesePredictor.isCjk(prevCh) || prevCh.isLetterOrDigit())) {
+                    ic.deleteSurroundingText(1, 0)
+                    ic.commitText("。", 1)
+                    lastSpaceAt = 0
+                    showZhPredictions = false
+                    updateCandidates()
+                    return
+                } else if (!chinese && prevCh.isLetterOrDigit()) {
+                    ic.deleteSurroundingText(1, 0)
+                    ic.commitText(". ", 1)
+                    lastSpaceAt = 0
+                    showNextPredictions = false
+                    updateAutoShift(); updateCandidates()
+                    return
+                }
             }
             ic.commitText(" ", 1)
-            showNextPredictions = !chinese && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)
+            showNextPredictions = !chinese && kbPrefs.postCommitPredict && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)
         }
         lastSpaceAt = now
         if (page == Page.SYMBOLS || page == Page.SYMBOLS2) { page = Page.LETTERS; refreshLayout() }
@@ -1152,7 +1234,7 @@ class ImeService : InputMethodService(),
         if (!chinese && useAutoCorrect && kbPrefs.autoCorrect && scene.autoCorrect) {
             if (typed != rejected) result?.takeIf { it.typed == typed }?.autoCorrect?.let { out = it }
         }
-        ic?.commitText(out, 1)
+        commitFormatted(ic, out, skipBeforeLen = typed.length)
         if (!chinese && scene.learn) english?.learn(out, prevWord = prev)
         composing.clear(); result = null
         rejected = null
@@ -1265,19 +1347,32 @@ class ImeService : InputMethodService(),
             scene.kind == FieldKind.URL && !chinese && urlSuggestions(labels, commits) -> {
                 keepToolbarEdges = labels.isNotEmpty()
             }
-            chinese && showZhPredictions && scene.suggestions && scene.kind != FieldKind.PASSWORD && overlay == Overlay.NONE -> {
+            chinese && showZhPredictions && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD && overlay == Overlay.NONE -> {
                 val before = currentInputConnection?.getTextBeforeCursor(8, 0)?.toString().orEmpty()
+                val emojis = EmojiPredictor.predictForChinese(before)
                 var nexts = zhPredictor?.predict(before, max = 8).orEmpty()
                 if (RimeEngine.traditional && nexts.isNotEmpty()) {
                     nexts = nexts.map { HandwritingEngine.toTraditional(this, it) }.distinct()
                 }
-                for (w in nexts) { labels += w; commits += w }
+                emojis.firstOrNull()?.let { labels += it; commits += it }
+                nexts.forEachIndexed { idx, w ->
+                    if (w !in commits) { labels += w; commits += w }
+                    if (idx == 0 && emojis.size > 1 && emojis[1] !in commits) {
+                        labels += emojis[1]; commits += emojis[1]
+                    }
+                }
+                if (nexts.isEmpty() && emojis.size > 1 && emojis[1] !in commits) {
+                    labels += emojis[1]; commits += emojis[1]
+                }
                 keepToolbarEdges = labels.isNotEmpty()
             }
-            !chinese && showNextPredictions && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL) && overlay == Overlay.NONE -> {
+            !chinese && showNextPredictions && kbPrefs.postCommitPredict && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL) && overlay == Overlay.NONE -> {
                 val prev = prevEnglishWord()
+                val emojis = EmojiPredictor.predictForEnglish(prev)
                 val nexts = english?.predictNext(prev, capitalizeFirst = shift != ShiftState.OFF, max = 6).orEmpty()
+                emojis.firstOrNull()?.let { labels += it; commits += it }
                 for (w in nexts) { labels += w; commits += w }
+                if (emojis.size > 1) { labels += emojis[1]; commits += emojis[1] }
                 keepToolbarEdges = labels.isNotEmpty()
             }
         }
@@ -1345,27 +1440,36 @@ class ImeService : InputMethodService(),
         lastAutoCorrect = null
         if (composing.isNotEmpty()) {
             val prev = if (!chinese) prevEnglishWord() else null
-            ic.commitText(text, 1)
+            commitFormatted(ic, text, skipBeforeLen = composing.length)
             if (!chinese && scene.learn) english?.learn(text, prevWord = prev)
             composing.clear(); result = null
             if (scene.spaceAfterPick && !chinese) {
                 ic.commitText(" ", 1)
-                showNextPredictions = scene.suggestions && scene.kind == FieldKind.TEXT
+                showNextPredictions = kbPrefs.postCommitPredict && scene.suggestions && scene.kind == FieldKind.TEXT
             } else if (!chinese && scene.kind == FieldKind.URL && !text.endsWith(".") && !text.endsWith("/")) {
                 showNextPredictions = false
             }
         } else if (chinese && showZhPredictions) {
             val prevZh = trailingZhWordBeforeCursor()
-            ic.commitText(text, 1)
-            recordChineseCommit(prevZh, text)
+            commitFormatted(ic, text)
+            if (text.any(ChinesePredictor::isCjk)) {
+                recordChineseCommit(prevZh, text)
+            } else {
+                showZhPredictions = false
+            }
         } else if (!chinese && showNextPredictions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)) {
-            val prev = prevEnglishWord()
-            ic.commitText("$text ", 1)
-            if (scene.learn) english?.learn(text, prevWord = prev)
-            if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
-            showNextPredictions = true
+            if (text.any { it.isLetterOrDigit() }) {
+                val prev = prevEnglishWord()
+                ic.commitText("$text ", 1)
+                if (scene.learn) english?.learn(text, prevWord = prev)
+                if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
+                showNextPredictions = kbPrefs.postCommitPredict
+            } else {
+                ic.commitText(text, 1)
+                showNextPredictions = false
+            }
         } else {
-            ic.commitText(text, 1)
+            commitFormatted(ic, text)
         }
         updateAutoShift()
         updateCandidates()
@@ -1395,7 +1499,7 @@ class ImeService : InputMethodService(),
         zh = RimeEngine.snapshot()
         if (commit != null) {
             val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
-            ic?.commitText(commit, 1)
+            commitFormatted(ic, commit, skipBeforeLen = oldShownLen)
             recordChineseCommit(prevZh, commit)
         }
         if (zh.input != aiInput) {
@@ -1474,7 +1578,7 @@ class ImeService : InputMethodService(),
         zh = EMPTY_ZH
         aiSuggestion = null
         aiRunnerUp = null
-        currentInputConnection?.commitText(text, 1)
+        commitFormatted(currentInputConnection, text, skipBeforeLen = oldShownLen)
         if (pickedAi) AiRanker.feedback(pickedAi = true, pickedRime = false)
         recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
@@ -1543,7 +1647,7 @@ class ImeService : InputMethodService(),
         hwGen.incrementAndGet()
         hwCandidates = emptyList()
         handwriting.hasPendingComposition = false
-        currentInputConnection?.commitText(top, 1)
+        commitFormatted(currentInputConnection, top, skipBeforeLen = top.length)
         recordChineseCommit(prevZh, top)
         updateCandidates()
     }
@@ -1604,7 +1708,7 @@ class ImeService : InputMethodService(),
             handwriting.clearCanvas(notify = false)
             handwriting.hasPendingComposition = false
         }
-        currentInputConnection?.commitText(text, 1)
+        commitFormatted(currentInputConnection, text, skipBeforeLen = oldTopLen)
         recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
         updateCandidates()
@@ -1669,10 +1773,11 @@ class ImeService : InputMethodService(),
 
     private fun zhCommitRaw() {
         if (!zhComposing) return
+        val oldShownLen = zhDisplay().length
         val raw = if (isT9()) zhDisplay().replace(" ", "") else zh.input
         RimeEngine.clear()
         zh = EMPTY_ZH
-        currentInputConnection?.commitText(raw, 1)
+        commitFormatted(currentInputConnection, raw, skipBeforeLen = oldShownLen)
         updateCandidates()
     }
 

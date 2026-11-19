@@ -336,7 +336,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 if (t.key.alts.isNotEmpty()) handler.postDelayed(t.longPress, lpDelay)
             }
             KeyType.SPACE -> if (prefs.spaceSwipeCursor) handler.postDelayed(t.longPress, 420)
-            KeyType.LANG, KeyType.EMOJI -> handler.postDelayed(t.longPress, 420)
+            KeyType.LANG, KeyType.EMOJI, KeyType.ENTER -> handler.postDelayed(t.longPress, 420)
             else -> Unit
         }
     }

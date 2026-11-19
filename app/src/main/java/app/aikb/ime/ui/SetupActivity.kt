@@ -2,9 +2,20 @@ package app.aikb.ime.ui
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
+import android.view.HapticFeedbackConstants
+import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
+import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -28,29 +39,39 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import app.aikb.ime.ImeService
+import app.aikb.ime.OtpNotificationService
 import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.HandwritingEngine
 import app.aikb.ime.engine.RecentImageStore
 import app.aikb.ime.engine.RimeEngine
 import app.aikb.ime.engine.UserHistory
-import app.aikb.ime.keyboard.KbTheme
-import app.aikb.ime.keyboard.KeyboardPrefs
+import app.aikb.ime.keyboard.*
 import java.io.BufferedInputStream
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import kotlin.math.roundToInt
 
+private enum class PreviewMode(val label: String) {
+    KEYBOARD("拼音键盘"),
+    HANDWRITING("手写面板"),
+    T9("九宫格"),
+}
+
 class SetupActivity : ComponentActivity() {
     private var enabled by mutableStateOf(false)
     private var selected by mutableStateOf(false)
     private var imagePermGranted by mutableStateOf(false)
+    private var otpNotifGranted by mutableStateOf(false)
 
     private val micPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -73,6 +94,7 @@ class SetupActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         imagePermGranted = RecentImageStore.hasImagePermission(this)
+        otpNotifGranted = OtpNotificationService.isNotificationAccessEnabled(this)
         setContent { AppTheme { Screen() } }
         handlePermissionExtras(intent)
     }
@@ -109,84 +131,178 @@ class SetupActivity : ComponentActivity() {
     private fun refresh() {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         enabled = imm.enabledInputMethodList.any { it.packageName == packageName }
-        selected = if (android.os.Build.VERSION.SDK_INT >= 34) {
+        selected = if (Build.VERSION.SDK_INT >= 34) {
             imm.currentInputMethodInfo?.packageName == packageName
         } else {
             Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD).orEmpty()
                 .startsWith("$packageName/")
         }
         imagePermGranted = RecentImageStore.hasImagePermission(this)
+        otpNotifGranted = OtpNotificationService.isNotificationAccessEnabled(this)
     }
 
     @Composable
     private fun Screen() {
         val prefs = remember { getSharedPreferences(ImeService.PREFS, Context.MODE_PRIVATE) }
+        var kbPrefsState by remember { mutableStateOf(KeyboardPrefs.from(prefs)) }
+        var previewExpanded by remember { mutableStateOf(true) }
+        var previewMode by remember {
+            val initHw = prefs.getBoolean(ImeService.KEY_HANDWRITING, false)
+            val initSchema = prefs.getString(ImeService.KEY_SCHEMA, "rime_ice")
+            mutableStateOf(
+                when {
+                    initHw -> PreviewMode.HANDWRITING
+                    initSchema == "t9" -> PreviewMode.T9
+                    else -> PreviewMode.KEYBOARD
+                },
+            )
+        }
+        var lastChangedKey by remember { mutableStateOf<String?>(null) }
+
+        DisposableEffect(prefs) {
+            val listener = SharedPreferences.OnSharedPreferenceChangeListener { p, key ->
+                kbPrefsState = KeyboardPrefs.from(p)
+                lastChangedKey = key
+                when (key) {
+                    KeyboardPrefs.KEY_HW_HEIGHT_SCALE,
+                    KeyboardPrefs.KEY_HW_STROKE_DP,
+                    KeyboardPrefs.KEY_HW_AUTOCOMMIT_MS,
+                    -> {
+                        previewMode = PreviewMode.HANDWRITING
+                        previewExpanded = true
+                    }
+                    ImeService.KEY_HANDWRITING -> {
+                        if (p.getBoolean(ImeService.KEY_HANDWRITING, false)) {
+                            previewMode = PreviewMode.HANDWRITING
+                            previewExpanded = true
+                        }
+                    }
+                    ImeService.KEY_SCHEMA -> {
+                        val sc = p.getString(ImeService.KEY_SCHEMA, "rime_ice")
+                        previewMode = if (sc == "t9") PreviewMode.T9 else PreviewMode.KEYBOARD
+                        previewExpanded = true
+                    }
+                    KeyboardPrefs.KEY_NUMBER_ROW,
+                    KeyboardPrefs.KEY_SHOW_HINTS,
+                    KeyboardPrefs.KEY_ENTER_TO_SEND,
+                    KeyboardPrefs.KEY_OTP_AUTOFILL,
+                    -> {
+                        if (previewMode == PreviewMode.HANDWRITING) previewMode = PreviewMode.KEYBOARD
+                        previewExpanded = true
+                    }
+                    KeyboardPrefs.KEY_THEME_ID,
+                    KeyboardPrefs.KEY_BORDERS,
+                    KeyboardPrefs.KEY_RADIUS_DP,
+                    KeyboardPrefs.KEY_HEIGHT_SCALE,
+                    KeyboardPrefs.KEY_WIDTH_RATIO,
+                    KeyboardPrefs.KEY_ONE_HAND_ALIGN,
+                    KeyboardPrefs.KEY_BOTTOM_OFFSET_DP,
+                    KeyboardPrefs.KEY_FONT_SCALE,
+                    KeyboardPrefs.KEY_CAND_FONT_SCALE,
+                    -> {
+                        previewExpanded = true
+                    }
+                }
+            }
+            prefs.registerOnSharedPreferenceChangeListener(listener)
+            onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+        }
+
+        val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+
         Column(
             Modifier
                 .fillMaxSize()
                 .background(MaterialTheme.colorScheme.background)
                 .systemBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .imePadding()
-                .padding(horizontal = 18.dp, vertical = 14.dp),
+                .imePadding(),
         ) {
-            HeroBanner()
-            Spacer(Modifier.height(18.dp))
+            Column(
+                Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 18.dp, vertical = 14.dp),
+            ) {
+                HeroBanner()
+                Spacer(Modifier.height(18.dp))
 
-            if (!enabled || !selected) {
-                SectionTitle("快速启用")
-                CardBox {
-                    StepRow(1, "在系统设置中启用灵犀输入法", done = enabled) {
-                        startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                if (!enabled || !selected) {
+                    SectionTitle("快速启用")
+                    CardBox {
+                        StepRow(1, "在系统设置中启用灵犀输入法", done = enabled) {
+                            startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                        }
+                        RowDivider()
+                        StepRow(2, "切换为当前默认输入法", done = selected, enabledRow = enabled) {
+                            (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                        }
                     }
-                    RowDivider()
-                    StepRow(2, "切换为当前默认输入法", done = selected, enabledRow = enabled) {
-                        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
-                    }
+                    Spacer(Modifier.height(20.dp))
                 }
-                Spacer(Modifier.height(20.dp))
+
+                SectionTitle("实时打字与功能沙盒")
+                CardBox {
+                    TryField("点此唤起真实输入法打字测试（下方调参面板会自动避让）…", KeyboardOptions(capitalization = KeyboardCapitalization.Sentences))
+                    RowDivider()
+                    TryField("浏览器网址 / 搜索框体验", KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Search))
+                    RowDivider()
+                    TryField("邮箱与 1Password 自动填充体验", KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next))
+                }
+
+                Spacer(Modifier.height(22.dp))
+                ThemeAndStyleSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                SizeAndErgonomicsSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                AuxiliaryInputSection(
+                    prefs = prefs,
+                    otpNotifGranted = otpNotifGranted,
+                    onOpenNotifAccess = {
+                        runCatching {
+                            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        }
+                    },
+                )
+
+                Spacer(Modifier.height(22.dp))
+                LayoutAndFeelSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                HandwritingCustomSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                ChineseSchemaSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                AiSection(prefs)
+
+                Spacer(Modifier.height(22.dp))
+                AutofillAndImageSection(
+                    prefs = prefs,
+                    imagePermGranted = imagePermGranted,
+                    onRequestImagePerm = { imgPermissionLauncher.launch(RecentImageStore.requiredPermissions()) },
+                )
+
+                Spacer(Modifier.height(22.dp))
+                PrivacySection(prefs)
+                Spacer(Modifier.height(24.dp))
             }
 
-            SectionTitle("实时打字与功能沙盒")
-            CardBox {
-                TryField("点此立即体验（拼音 / 手写 / 纠错 / 缩放）…", KeyboardOptions(capitalization = KeyboardCapitalization.Sentences))
-                RowDivider()
-                TryField("浏览器网址 / 搜索框体验", KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Search))
-                RowDivider()
-                TryField("邮箱与 1Password 自动填充体验", KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next))
+            if (!imeVisible) {
+                LiveKeyboardPreviewDock(
+                    kbPrefs = kbPrefsState,
+                    mode = previewMode,
+                    expanded = previewExpanded,
+                    lastChangedKey = lastChangedKey,
+                    onModeChange = {
+                        previewMode = it
+                        previewExpanded = true
+                    },
+                    onToggleExpanded = { previewExpanded = !previewExpanded },
+                )
             }
-
-            Spacer(Modifier.height(22.dp))
-            ThemeAndStyleSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            SizeAndErgonomicsSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            LayoutAndFeelSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            HandwritingCustomSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            ChineseSchemaSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            AiSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            AutofillAndImageSection(
-                prefs = prefs,
-                imagePermGranted = imagePermGranted,
-                onRequestImagePerm = { imgPermissionLauncher.launch(RecentImageStore.requiredPermissions()) },
-            )
-
-            Spacer(Modifier.height(22.dp))
-            FuzzyPinyinSection(prefs)
-
-            Spacer(Modifier.height(22.dp))
-            PrivacySection(prefs)
-            Spacer(Modifier.height(36.dp))
         }
     }
 
@@ -213,12 +329,12 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v2.0 旗舰离线版", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v2.1 旗舰离线版", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "零网络权限 · 233万搜狗级词库 · 4万生僻字大画布手写 · 端侧AI智能选句 · 1Password内联填充",
+                    "零网络权限 · 所见即所得实时调参预览 · 微信键盘辅助输入全对齐 · 233万词库 · 4万生僻字手写 · 内置AI选句",
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
                     color = Color.White.copy(alpha = 0.90f),
@@ -228,8 +344,351 @@ class SetupActivity : ComponentActivity() {
     }
 }
 
+/**
+ * Sticky bottom WYSIWYG live keyboard preview dock:
+ * renders the exact Canvas `PreeditBar` + `CandidateBar` + (`KeyboardView` | `HandwritingView` | `T9View`)
+ * so every slider/switch adjustment in settings is immediately visible at 60/120fps without blind tuning!
+ */
 @Composable
-private fun ThemeAndStyleSection(prefs: android.content.SharedPreferences) {
+private fun LiveKeyboardPreviewDock(
+    kbPrefs: KeyboardPrefs,
+    mode: PreviewMode,
+    expanded: Boolean,
+    lastChangedKey: String?,
+    onModeChange: (PreviewMode) -> Unit,
+    onToggleExpanded: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface),
+    ) {
+        HorizontalDivider(thickness = 0.8.dp, color = Secondary().copy(alpha = 0.28f))
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "实时键盘预览",
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.width(8.dp))
+            Row(
+                Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                PreviewMode.entries.forEach { m ->
+                    val active = expanded && mode == m
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                if (active) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f),
+                            )
+                            .clickable { onModeChange(m) }
+                            .padding(horizontal = 9.dp, vertical = 3.5.dp),
+                    ) {
+                        Text(
+                            m.label,
+                            fontSize = 11.5.sp,
+                            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (active) Color.White else MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+            }
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(onClick = onToggleExpanded)
+                    .padding(horizontal = 8.dp, vertical = 3.5.dp),
+            ) {
+                Text(
+                    if (expanded) "收起 ⌄" else "展开预览 ▲",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+        }
+
+        if (expanded) {
+            AndroidView(
+                factory = { ctx -> PreviewKeyboardHostView(ctx) },
+                update = { view -> view.bind(kbPrefs, mode, lastChangedKey) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .wrapContentHeight(),
+            )
+        }
+    }
+}
+
+/**
+ * Standalone Canvas host mirroring `ImeService.onCreateInputView()` 1:1 for live preview & tactile testing.
+ */
+private class PreviewKeyboardHostView(context: Context) : FrameLayout(context) {
+    private val previewOverlay = PreviewOverlay(context)
+    private val preeditBar = PreeditBar(context)
+    private val candidateBar = CandidateBar(context) { _ -> triggerPreviewHaptic() }
+    private val column: LinearLayout
+    private val keyboardView: KeyboardView
+    private val handwritingView: HandwritingView
+    private val t9View: T9View
+
+    private var currentPrefs = KeyboardPrefs()
+    private var currentMode = PreviewMode.KEYBOARD
+    private var previewChinese = true
+    private var previewPage = Page.LETTERS
+    private var previewShift = ShiftState.OFF
+
+    private val vibrator: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
+    } else {
+        @Suppress("DEPRECATION")
+        context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+    }
+
+    private fun triggerPreviewHaptic() {
+        if (!currentPrefs.haptics || currentPrefs.hapticStrengthMs <= 0) return
+        val vib = vibrator
+        if (vib != null && vib.hasVibrator()) {
+            val ms = currentPrefs.hapticStrengthMs.toLong().coerceIn(4L, 60L)
+            val amp = (currentPrefs.hapticStrengthMs * 4.5f).toInt().coerceIn(35, 255)
+            runCatching {
+                vib.vibrate(VibrationEffect.createOneShot(ms, amp))
+                return
+            }
+        }
+        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+    }
+
+    private fun playFeedback(key: Key) {
+        triggerPreviewHaptic()
+        if (currentPrefs.sound) {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val fx = when (key.type) {
+                KeyType.DELETE -> AudioManager.FX_KEYPRESS_DELETE
+                KeyType.SPACE -> AudioManager.FX_KEYPRESS_SPACEBAR
+                KeyType.ENTER -> AudioManager.FX_KEYPRESS_RETURN
+                else -> AudioManager.FX_KEYPRESS_STANDARD
+            }
+            am?.playSoundEffect(fx, -1f)
+        }
+    }
+
+    private val kbListener = object : KeyboardView.Listener {
+        override fun onText(key: Key, text: String) = Unit
+        override fun onFunction(key: Key) {
+            when (key.type) {
+                KeyType.SHIFT -> {
+                    previewShift = if (previewShift == ShiftState.OFF) ShiftState.ONCE else ShiftState.OFF
+                    keyboardView.shift = previewShift
+                }
+                KeyType.LANG -> {
+                    previewChinese = !previewChinese
+                    syncKeyboardFace()
+                }
+                KeyType.TO_SYMBOLS -> {
+                    previewPage = Page.SYMBOLS
+                    syncKeyboardFace()
+                }
+                KeyType.TO_SYMBOLS2 -> {
+                    previewPage = Page.SYMBOLS2
+                    syncKeyboardFace()
+                }
+                KeyType.TO_LETTERS -> {
+                    previewPage = Page.LETTERS
+                    syncKeyboardFace()
+                }
+                else -> Unit
+            }
+        }
+        override fun onDeleteDown(repeat: Boolean) = Unit
+        override fun onCursorMove(steps: Int) = Unit
+        override fun onLongPressFunction(key: Key) = Unit
+        override fun onKeyDownFeedback(key: Key) = playFeedback(key)
+    }
+
+    private val hwListener = object : HandwritingView.Listener {
+        override fun onHandwritingStrokes(strokes: List<List<HandwritingEngine.Point>>) = Unit
+        override fun onHandwritingAutoCommitPrevious() = Unit
+        override fun onHandwritingClear() = Unit
+        override fun onHandwritingPunct(punct: String) = Unit
+        override fun onHandwritingExitToKeyboard() = Unit
+        override fun onHandwritingCycleHeight() = Unit
+        override fun onFunction(key: Key) = Unit
+        override fun onDeleteDown(repeat: Boolean) = Unit
+        override fun onKeyDownFeedback(key: Key) = playFeedback(key)
+    }
+
+    private val t9Listener = object : T9View.Listener {
+        override fun onT9Digit(digit: Char) = Unit
+        override fun onT9Separator() = Unit
+        override fun onT9Side(index: Int) = Unit
+        override fun onT9Clear() = Unit
+        override fun onFunction(key: Key) = Unit
+        override fun onDeleteDown(repeat: Boolean) = Unit
+        override fun onKeyDownFeedback(key: Key) = playFeedback(key)
+    }
+
+    init {
+        keyboardView = KeyboardView(context, kbListener).also { it.previewOverlay = previewOverlay }
+        handwritingView = HandwritingView(context, hwListener).apply {
+            previewDemoMode = true
+            visibility = View.GONE
+        }
+        t9View = T9View(context, t9Listener).apply {
+            sideItems = listOf("shi", "zhi", "，", "。", "？", "！")
+            spaceLabel = "选定"
+            visibility = View.GONE
+        }
+
+        val stack = FrameLayout(context).apply {
+            addView(keyboardView, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(handwritingView, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(t9View, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        column = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(preeditBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(candidateBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(stack, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        addView(column, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        addView(previewOverlay, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (w > 0 && w != oldw) applySqueezePadding(w)
+    }
+
+    private fun applySqueezePadding(hostWidth: Int) {
+        val squeezePx = ((1f - currentPrefs.widthRatio) * hostWidth).toInt().coerceAtLeast(0)
+        val padL = when {
+            currentPrefs.oneHandAlign < 0 -> 0
+            currentPrefs.oneHandAlign > 0 -> squeezePx
+            else -> squeezePx / 2
+        }
+        val padR = squeezePx - padL
+        val bottomPx = (currentPrefs.bottomOffsetDp * resources.displayMetrics.density).toInt()
+        column.setPadding(padL, 0, padR, bottomPx)
+    }
+
+    private fun syncKeyboardFace() {
+        val layout = when (previewPage) {
+            Page.LETTERS -> Layouts.letters(
+                BottomRow.TEXT,
+                previewChinese,
+                if (previewChinese) "全拼" else null,
+                numberRow = currentPrefs.numberRow,
+            )
+            Page.SYMBOLS -> Layouts.symbols(BottomRow.TEXT, previewChinese)
+            Page.SYMBOLS2 -> Layouts.symbols2(BottomRow.TEXT, previewChinese)
+            else -> Layouts.letters(BottomRow.TEXT, previewChinese, "全拼", numberRow = currentPrefs.numberRow)
+        }
+        keyboardView.layout = layout
+        keyboardView.chinese = previewChinese
+        keyboardView.shift = previewShift
+        keyboardView.hints = if (previewPage == Page.LETTERS && currentPrefs.showKeyHints) {
+            Layouts.symbolHints(previewChinese, currentPrefs.numberRow)
+        } else {
+            emptyMap()
+        }
+        val enterLbl = if (currentPrefs.enterToSend) {
+            (if (previewChinese) "发送" else "send") to true
+        } else {
+            (if (previewChinese) "换行" else "return") to false
+        }
+        keyboardView.enterLabel = enterLbl.first
+        keyboardView.enterAccent = enterLbl.second
+        handwritingView.enterLabel = enterLbl.first
+        handwritingView.enterAccent = enterLbl.second
+        t9View.enterLabel = enterLbl.first
+        t9View.enterAccent = enterLbl.second
+    }
+
+    fun bind(prefs: KeyboardPrefs, mode: PreviewMode, lastChangedKey: String?) {
+        val prev = currentPrefs
+        val modeChanged = currentMode != mode
+        currentPrefs = prefs
+        currentMode = mode
+
+        val t = KbTheme.resolve(context, prefs)
+        setBackgroundColor(t.background)
+        preeditBar.theme = t
+        candidateBar.theme = t
+        keyboardView.theme = t
+        handwritingView.theme = t
+        t9View.theme = t
+        previewOverlay.theme = t
+
+        candidateBar.prefs = prefs
+        keyboardView.prefs = prefs
+        handwritingView.prefs = prefs
+        t9View.prefs = prefs
+
+        syncKeyboardFace()
+
+        keyboardView.visibility = if (mode == PreviewMode.KEYBOARD) View.VISIBLE else View.GONE
+        handwritingView.visibility = if (mode == PreviewMode.HANDWRITING) View.VISIBLE else View.GONE
+        t9View.visibility = if (mode == PreviewMode.T9) View.VISIBLE else View.GONE
+
+        val showOtpSample = lastChangedKey == KeyboardPrefs.KEY_OTP_AUTOFILL && prefs.otpAutoFill && mode != PreviewMode.HANDWRITING
+        when {
+            showOtpSample -> {
+                preeditBar.text = ""
+                candidateBar.expandable = false
+                candidateBar.freshOtpCode = "2046"
+                candidateBar.freshOtpSource = "信息"
+                candidateBar.setItems(emptyList(), -1)
+            }
+            mode == PreviewMode.HANDWRITING -> {
+                preeditBar.text = ""
+                candidateBar.freshOtpCode = null
+                candidateBar.expandable = true
+                candidateBar.setItems(listOf("永", "水", "咏", "泳", "求"), 0)
+            }
+            else -> {
+                preeditBar.text = "qiu shui shi zhi"
+                candidateBar.freshOtpCode = null
+                candidateBar.expandable = true
+                val sampleCands = if (prefs.postCommitPredict) {
+                    listOf("✦ 时至", "是指", "🎂", "天天开心", "实质")
+                } else {
+                    listOf("✦ 时至", "是指", "实质", "市值", "食指")
+                }
+                candidateBar.setItems(sampleCands, 0)
+            }
+        }
+
+        val hostW = width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        applySqueezePadding(hostW)
+
+        if (modeChanged ||
+            prev.heightScale != prefs.heightScale ||
+            prev.hwHeightScale != prefs.hwHeightScale ||
+            prev.numberRow != prefs.numberRow ||
+            prev.bottomOffsetDp != prefs.bottomOffsetDp ||
+            prev.widthRatio != prefs.widthRatio
+        ) {
+            keyboardView.requestLayout()
+            handwritingView.requestLayout()
+            t9View.requestLayout()
+            column.requestLayout()
+            requestLayout()
+        }
+    }
+}
+
+@Composable
+private fun ThemeAndStyleSection(prefs: SharedPreferences) {
     var selectedTheme by remember { mutableStateOf(prefs.getString(KeyboardPrefs.KEY_THEME_ID, "system") ?: "system") }
     var keyBorders by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_BORDERS, true)) }
     var radiusDp by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_RADIUS_DP, 7.5f)) }
@@ -302,7 +761,7 @@ private fun ThemeAndStyleSection(prefs: android.content.SharedPreferences) {
 }
 
 @Composable
-private fun SizeAndErgonomicsSection(prefs: android.content.SharedPreferences) {
+private fun SizeAndErgonomicsSection(prefs: SharedPreferences) {
     var heightScale by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_HEIGHT_SCALE, 1.00f)) }
     var widthRatio by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_WIDTH_RATIO, 1.00f)) }
     var align by remember { mutableStateOf(prefs.getInt(KeyboardPrefs.KEY_ONE_HAND_ALIGN, 0)) }
@@ -310,7 +769,7 @@ private fun SizeAndErgonomicsSection(prefs: android.content.SharedPreferences) {
     var keyFont by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_FONT_SCALE, 1.00f)) }
     var candFont by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_CAND_FONT_SCALE, 1.00f)) }
 
-    SectionTitle("键盘大小与单手模式（等比无损缩放）")
+    SectionTitle("键盘大小与单手模式（下方实时预览）")
     CardBox {
         SliderItem(
             title = "键盘整体高度",
@@ -417,8 +876,212 @@ private fun SizeAndErgonomicsSection(prefs: android.content.SharedPreferences) {
     )
 }
 
+/**
+ * Complete 9-item WeChat Keyboard (`微信键盘`) "辅助输入" feature parity card.
+ */
 @Composable
-private fun LayoutAndFeelSection(prefs: android.content.SharedPreferences) {
+private fun AuxiliaryInputSection(
+    prefs: SharedPreferences,
+    otpNotifGranted: Boolean,
+    onOpenNotifAccess: () -> Unit,
+) {
+    val context = LocalContext.current
+    var enterSend by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_ENTER_TO_SEND, false)) }
+    var spaceCnNum by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SPACE_CN_NUM, false)) }
+    var spaceCnEn by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SPACE_CN_EN, false)) }
+    var otpAutoFill by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_OTP_AUTOFILL, true)) }
+    var autoCaps by remember { mutableStateOf(prefs.getBoolean("auto_caps", true)) }
+    var doubleSpace by remember { mutableStateOf(prefs.getBoolean("double_space", true)) }
+    var smartZh by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SMART_PINYIN_CORRECT, true)) }
+    var autoEn by remember { mutableStateOf(prefs.getBoolean("auto_correct", true)) }
+    var postPredict by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_POST_PREDICT, true)) }
+
+    var fuzzyOn by remember { mutableStateOf(prefs.getBoolean(RimeEngine.PREF_FUZZY_ENABLED, false)) }
+    var fuzzySelected by remember {
+        mutableStateOf(prefs.getStringSet(RimeEngine.PREF_FUZZY_PAIRS, RimeEngine.COMMON_FUZZY_IDS)!!.toSet())
+    }
+    var fuzzyExpanded by remember { mutableStateOf(false) }
+    var rimeState by remember { mutableStateOf(RimeEngine.state) }
+
+    DisposableEffect(Unit) {
+        val cb = { rimeState = RimeEngine.state }
+        RimeEngine.addStateListener(cb)
+        onDispose { RimeEngine.removeStateListener(cb) }
+    }
+
+    fun applyFuzzy(nextOn: Boolean, nextSet: Set<String>) {
+        fuzzyOn = nextOn
+        fuzzySelected = nextSet
+        prefs.edit()
+            .putBoolean(RimeEngine.PREF_FUZZY_ENABLED, nextOn)
+            .putStringSet(RimeEngine.PREF_FUZZY_PAIRS, HashSet(nextSet))
+            .apply()
+        RimeEngine.redeployFuzzy(context)
+    }
+
+    SectionTitle("辅助输入（微信键盘同款全对齐）")
+    CardBox {
+        SwitchItem(
+            title = "回车键发送",
+            subtitle = "开启后多行聊天框右下角变为蓝色「发送」，长按回车仍可换行",
+            checked = enterSend,
+        ) {
+            enterSend = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_ENTER_TO_SEND, it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "中文和数字间加空格",
+            subtitle = "示例：你好 2024",
+            checked = spaceCnNum,
+        ) {
+            spaceCnNum = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_SPACE_CN_NUM, it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "中文和英文间加空格",
+            subtitle = "示例：你好 Hello（保留 5G / iPhone16 不拆散）",
+            checked = spaceCnEn,
+        ) {
+            spaceCnEn = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_SPACE_CN_EN, it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "验证码自动提取",
+            subtitle = "收到短信或复制验证码后在顶栏显示「🔑 2046 · 来自信息」，90 秒纯内存即焚",
+            checked = otpAutoFill,
+        ) {
+            otpAutoFill = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_OTP_AUTOFILL, it).apply()
+        }
+        if (otpAutoFill) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenNotifAccess)
+                    .padding(start = 16.dp, end = 16.dp, bottom = 10.dp, top = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "短信通知自动提取权限（不开启仍支持剪贴板提取）",
+                    fontSize = 13.sp,
+                    color = Secondary(),
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    if (otpNotifGranted) "已开启 ✓" else "去开启 ›",
+                    fontSize = 13.5.sp,
+                    color = if (otpNotifGranted) Color(0xFF16A34A) else MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+        RowDivider()
+        SwitchItem(
+            title = "英文键盘 - 首字母自动大写",
+            subtitle = "句首或换行后自动大写首个英文字母",
+            checked = autoCaps,
+        ) {
+            autoCaps = it; prefs.edit().putBoolean("auto_caps", it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "双击空格输入句号",
+            subtitle = "中文键盘双击空格输入「。」，英文键盘双击输入「. 」",
+            checked = doubleSpace,
+        ) {
+            doubleSpace = it; prefs.edit().putBoolean("double_space", it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "模糊拼音（z=zh / c=ch / n=l 等 12 组）",
+            subtitle = when {
+                !fuzzyOn -> "支持平翘舌、前后鼻音等 12 组模糊音自定义组合"
+                rimeState == RimeEngine.State.DEPLOYING -> "正在后台更新模糊音索引…"
+                else -> "已启用 ${fuzzySelected.size} 组模糊音"
+            },
+            checked = fuzzyOn,
+        ) { on ->
+            val nextSet = if (on && fuzzySelected.isEmpty()) RimeEngine.COMMON_FUZZY_IDS else fuzzySelected
+            applyFuzzy(on, nextSet)
+            if (on) fuzzyExpanded = true
+        }
+        if (fuzzyOn) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { fuzzyExpanded = !fuzzyExpanded }
+                    .padding(horizontal = 16.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("配置模糊拼音明细（z/zh、c/ch、s/sh、in/ing…）", fontSize = 14.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
+                Text(if (fuzzyExpanded) "收起 ▲" else "设置 ▼", fontSize = 13.sp, color = Secondary())
+            }
+            if (fuzzyExpanded) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        "常用南方模糊音预设",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clickable { applyFuzzy(true, RimeEngine.COMMON_FUZZY_IDS) },
+                    )
+                    Text(
+                        "全选 12 组",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { applyFuzzy(true, RimeEngine.FUZZY_PAIRS.map { it.id }.toSet()) },
+                    )
+                }
+                RimeEngine.FUZZY_PAIRS.forEach { pair ->
+                    RowDivider()
+                    val checked = pair.id in fuzzySelected
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                val next = if (checked) fuzzySelected - pair.id else fuzzySelected + pair.id
+                                applyFuzzy(true, next)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 9.5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("${pair.group} · ${pair.label}", fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
+                        if (checked) Text("✓", fontSize = 17.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        RowDivider()
+        SwitchItem(
+            title = "中文键盘 - 拼音智能纠错",
+            subtitle = "修正邻键误触与双字母倒序（如 nihso → 你好，zhognguo → 中国）",
+            checked = smartZh,
+        ) {
+            smartZh = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_SMART_PINYIN_CORRECT, it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "英文键盘 - 单词自动改正",
+            subtitle = "示例：Helip → Hello，thebest → the best（退格键一键撤回原词）",
+            checked = autoEn,
+        ) {
+            autoEn = it; prefs.edit().putBoolean("auto_correct", it).apply()
+        }
+        RowDivider()
+        SwitchItem(
+            title = "输入后联想（含应景表情联想）",
+            subtitle = "示例：生日快乐 → 🎂 天天开心",
+            checked = postPredict,
+        ) {
+            postPredict = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_POST_PREDICT, it).apply()
+        }
+    }
+}
+
+@Composable
+private fun LayoutAndFeelSection(prefs: SharedPreferences) {
     var numRow by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_NUMBER_ROW, false)) }
     var showHints by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SHOW_HINTS, true)) }
     var keyPreview by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_PREVIEW, true)) }
@@ -483,12 +1146,12 @@ private fun LayoutAndFeelSection(prefs: android.content.SharedPreferences) {
 }
 
 @Composable
-private fun HandwritingCustomSection(prefs: android.content.SharedPreferences) {
+private fun HandwritingCustomSection(prefs: SharedPreferences) {
     var hwHeight by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_HW_HEIGHT_SCALE, 1.24f)) }
     var hwStroke by remember { mutableStateOf(prefs.getFloat(KeyboardPrefs.KEY_HW_STROKE_DP, 4.4f)) }
     var hwDelay by remember { mutableStateOf(prefs.getInt(KeyboardPrefs.KEY_HW_AUTOCOMMIT_MS, 800).toFloat()) }
 
-    SectionTitle("手写面板定制（4万生僻字全覆盖）")
+    SectionTitle("手写面板定制（拖动滑块自动切换手写预览）")
     CardBox {
         SliderItem(
             title = "手写画布高度比例",
@@ -523,13 +1186,9 @@ private fun HandwritingCustomSection(prefs: android.content.SharedPreferences) {
 }
 
 @Composable
-private fun ChineseSchemaSection(prefs: android.content.SharedPreferences) {
+private fun ChineseSchemaSection(prefs: SharedPreferences) {
     var schema by remember { mutableStateOf(prefs.getString(ImeService.KEY_SCHEMA, "rime_ice")!!) }
     var handwritingSelected by remember { mutableStateOf(prefs.getBoolean(ImeService.KEY_HANDWRITING, false)) }
-    var smartZh by remember { mutableStateOf(prefs.getBoolean(KeyboardPrefs.KEY_SMART_PINYIN_CORRECT, true)) }
-    var autoEn by remember { mutableStateOf(prefs.getBoolean("auto_correct", true)) }
-    var autoCaps by remember { mutableStateOf(prefs.getBoolean("auto_caps", true)) }
-    var doubleSpace by remember { mutableStateOf(prefs.getBoolean("double_space", true)) }
     var trad by remember { mutableStateOf(prefs.getBoolean(ImeService.KEY_TRADITIONAL, false)) }
 
     val modeOptions = remember {
@@ -541,24 +1200,8 @@ private fun ChineseSchemaSection(prefs: android.content.SharedPreferences) {
         }
     }
 
-    SectionTitle("输入方案与智能纠错")
+    SectionTitle("中文输入方案与简繁切换")
     CardBox {
-        SwitchItem("中文智能纠错（邻键误触 & 倒序修复）", "例如误打 nihso 自动提示「你好」，zhognguo 自动提示「中国」", smartZh) {
-            smartZh = it; prefs.edit().putBoolean(KeyboardPrefs.KEY_SMART_PINYIN_CORRECT, it).apply()
-        }
-        RowDivider()
-        SwitchItem("英文智能纠错与漏空格切分", "自动修正邻键拼写及 thebest → the best", autoEn) {
-            autoEn = it; prefs.edit().putBoolean("auto_correct", it).apply()
-        }
-        RowDivider()
-        SwitchItem("英文句首自动大写", null, autoCaps) {
-            autoCaps = it; prefs.edit().putBoolean("auto_caps", it).apply()
-        }
-        RowDivider()
-        SwitchItem("双击空格输入句号", null, doubleSpace) {
-            doubleSpace = it; prefs.edit().putBoolean("double_space", it).apply()
-        }
-        RowDivider()
         SwitchItem("输出繁体中文", null, trad) {
             trad = it; prefs.edit().putBoolean(ImeService.KEY_TRADITIONAL, it).apply()
         }
@@ -597,7 +1240,7 @@ private fun ChineseSchemaSection(prefs: android.content.SharedPreferences) {
 }
 
 @Composable
-private fun AiSection(prefs: android.content.SharedPreferences) {
+private fun AiSection(prefs: SharedPreferences) {
     val context = LocalContext.current
     val userFile = remember { AiRanker.modelFile(context) }
     val hasBuiltin = remember { AiRanker.hasBuiltinModel(context) }
@@ -680,7 +1323,7 @@ private fun AiSection(prefs: android.content.SharedPreferences) {
 
 @Composable
 private fun AutofillAndImageSection(
-    prefs: android.content.SharedPreferences,
+    prefs: SharedPreferences,
     imagePermGranted: Boolean,
     onRequestImagePerm: () -> Unit,
 ) {
@@ -719,97 +1362,7 @@ private fun AutofillAndImageSection(
 }
 
 @Composable
-private fun FuzzyPinyinSection(prefs: android.content.SharedPreferences) {
-    val context = LocalContext.current
-    var fuzzyOn by remember { mutableStateOf(prefs.getBoolean(RimeEngine.PREF_FUZZY_ENABLED, false)) }
-    var selected by remember {
-        mutableStateOf(prefs.getStringSet(RimeEngine.PREF_FUZZY_PAIRS, RimeEngine.COMMON_FUZZY_IDS)!!.toSet())
-    }
-    var expanded by remember { mutableStateOf(false) }
-    var rimeState by remember { mutableStateOf(RimeEngine.state) }
-
-    DisposableEffect(Unit) {
-        val cb = { rimeState = RimeEngine.state }
-        RimeEngine.addStateListener(cb)
-        onDispose { RimeEngine.removeStateListener(cb) }
-    }
-
-    fun applyFuzzy(nextOn: Boolean, nextSet: Set<String>) {
-        fuzzyOn = nextOn
-        selected = nextSet
-        prefs.edit()
-            .putBoolean(RimeEngine.PREF_FUZZY_ENABLED, nextOn)
-            .putStringSet(RimeEngine.PREF_FUZZY_PAIRS, HashSet(nextSet))
-            .apply()
-        RimeEngine.redeployFuzzy(context)
-    }
-
-    SectionTitle("模糊拼音（12组声韵母）")
-    CardBox {
-        SwitchItem(
-            title = "启用模糊拼音",
-            subtitle = if (!fuzzyOn) null else if (rimeState == RimeEngine.State.DEPLOYING) "正在后台更新模糊音索引…" else "已启用 ${selected.size} 组",
-            checked = fuzzyOn,
-        ) { on ->
-            val nextSet = if (on && selected.isEmpty()) RimeEngine.COMMON_FUZZY_IDS else selected
-            applyFuzzy(on, nextSet)
-            if (on) expanded = true
-        }
-        if (fuzzyOn) {
-            RowDivider()
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable { expanded = !expanded }
-                    .padding(horizontal = 16.dp, vertical = 11.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("展开选择模糊音组合", fontSize = 15.sp, color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
-                Text(if (expanded) "收起 ▲" else "展开 ▼", fontSize = 13.sp, color = Secondary())
-            }
-            if (expanded) {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    Text(
-                        "常用南方模糊音预设",
-                        fontSize = 13.5.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Medium,
-                        modifier = Modifier.clickable { applyFuzzy(true, RimeEngine.COMMON_FUZZY_IDS) },
-                    )
-                    Text(
-                        "全选 12 组",
-                        fontSize = 13.5.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.clickable { applyFuzzy(true, RimeEngine.FUZZY_PAIRS.map { it.id }.toSet()) },
-                    )
-                }
-                RimeEngine.FUZZY_PAIRS.forEach { pair ->
-                    RowDivider()
-                    val checked = pair.id in selected
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                val next = if (checked) selected - pair.id else selected + pair.id
-                                applyFuzzy(true, next)
-                            }
-                            .padding(horizontal = 16.dp, vertical = 10.5.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text("${pair.group} · ${pair.label}", fontSize = 15.5.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
-                        if (checked) Text("✓", fontSize = 17.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun PrivacySection(prefs: android.content.SharedPreferences) {
+private fun PrivacySection(prefs: SharedPreferences) {
     val context = LocalContext.current
     var cleared by remember { mutableStateOf(false) }
     SectionTitle("离线隐私保障")
@@ -829,7 +1382,7 @@ private fun PrivacySection(prefs: android.content.SharedPreferences) {
         }
     }
     Text(
-        "灵犀输入法在 AndroidManifest 中未声明 INTERNET 网络权限，操作系统内核层面阻断一切联网可能。您的所有输入、语音、手写、剪贴板与图片均 100% 留在手机本地。",
+        "灵犀输入法在 AndroidManifest 中未声明 INTERNET 网络权限，操作系统内核层面阻断一切联网可能。您的所有输入、语音、手写、验证码提取、剪贴板与图片均 100% 留在手机本地。",
         fontSize = 12.5.sp,
         lineHeight = 18.sp,
         color = Secondary(),
