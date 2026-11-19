@@ -6,13 +6,13 @@ Keylo 在 `AndroidManifest.xml` 中不声明 `android.permission.INTERNET` 与 `
 
 ---
 
-## 下载安装（Release v3.2.0）
+## 下载安装（Release v3.2.1）
 
 前往 [**Releases 页面**](https://github.com/wlx7/ai-keyboard/releases/latest) 按需选择下载：
 
-1. **🌟 `keylo-3.2.0-arm64.apk`（双擎完整旗舰版，主力推荐）**
-   - 直接内嵌 **`Keylo-460K Octagram 语法词图库`（`5.0 MiB`）** + **`Keylo-285M v2` 端侧专属大模型（`Q8_0` 高精词嵌入，约 `185 MiB`）** + **9 万词头多词/诗词上下句联想库** + **233 万条中文大词库** + **4 万字生僻字手写**，安装即享完整双引擎体验，无需额外配置（包名兼容旧版，可直接覆盖升级，彻底移除冗余离线语音体积立减 ~35 MiB）。
-2. **⚡ `keylo-3.2.0-lite-arm64.apk`（精简外挂版，内置 Octagram 语法库，仅 `52 MiB`）**
+1. **🌟 `keylo-3.2.1-arm64.apk`（双擎完整旗舰版，主力推荐）**
+   - 直接内嵌 **`Keylo-460K Octagram 语法词图库`（`5.0 MiB`）** + **`Keylo-285M v2` 端侧专属大模型（`Q8_0` 高精词嵌入，约 `185 MiB`）** + **9 万词头多词/诗词上下句联想库** + **233 万条中文大词库** + **4 万字生僻字手写**，安装即享完整双引擎体验，无需额外配置（包名兼容旧版，可直接覆盖升级，彻底移除冗余离线语音体积立减 ~42 MiB）。
+2. **⚡ `keylo-3.2.1-lite-arm64.apk`（精简外挂版，内置 Octagram 语法库，仅 `52 MiB`）**
    - 仍完整内置 `Keylo-460K Octagram` 毫秒级语法模型、9 万词头多词联想、233 万词库与全字集手写；可按需在设置页导入外部 `.gguf` 大模型或完整版 `wanxiang-lts-zh-hans.gram`。
 
 ---

@@ -416,12 +416,19 @@ class ImeService : InputMethodService(),
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         applyPrefsAndTheme()
-        val newFieldKey = "${info?.packageName.orEmpty()}#${info?.fieldId ?: 0}#${info?.inputType ?: 0}"
-        val preserveActiveComposition = restarting && newFieldKey == lastFieldKey && (zhComposing || composing.isNotEmpty())
+        val newScene = Scene.of(info)
+        val newFieldKey = "${info?.packageName.orEmpty()}#${info?.fieldId ?: 0}#${newScene.kind}"
+        val sameFieldRestart = restarting && newFieldKey == lastFieldKey
+        val elapsedSinceEdit = SystemClock.uptimeMillis() - lastEditAt
+        val curBefore = if (sameFieldRestart) currentInputConnection?.getTextBeforeCursor(4, 0)?.toString() else null
+        val fieldJustClearedByApp = sameFieldRestart && curBefore != null && curBefore.isEmpty() && elapsedSinceEdit > 280L
+        val preserveActiveSession = sameFieldRestart && !fieldJustClearedByApp && (
+            zhComposing || composing.isNotEmpty() || showZhPredictions || showNextPredictions || elapsedSinceEdit < 1500L
+        )
         lastFieldKey = newFieldKey
+        scene = newScene
 
-        scene = Scene.of(info)
-        if (!preserveActiveComposition) {
+        if (!preserveActiveSession) {
             chinese = when {
                 scene.forceEnglish -> false
                 scene.preferEnglishOnStart -> false
@@ -511,10 +518,14 @@ class ImeService : InputMethodService(),
             updateCandidates()
         }
         if (composing.isEmpty() && !zhComposing) {
-            if (elapsed >= 300 && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 2) {
+            val appClearedField = newSelStart == 0 && newSelEnd == 0 && oldSelStart > 0 &&
+                currentInputConnection?.getTextBeforeCursor(2, 0)?.isEmpty() == true
+            if (appClearedField || (elapsed >= 900 && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 2)) {
                 resetZhLearningChain()
                 showNextPredictions = false
                 showZhPredictions = false
+                lastCommittedZhContext = ""
+                aiNextPredictions = emptyList()
                 updateCandidates()
             }
             updateAutoShift()
@@ -976,6 +987,14 @@ class ImeService : InputMethodService(),
     private fun skipSuffixSafe(raw: String, skipLen: Int): Boolean =
         skipLen > 0 && raw.length >= skipLen
 
+    /**
+     * Chinese post-commit prediction applies in all prose/search/chat fields regardless of
+     * `TYPE_TEXT_FLAG_NO_SUGGESTIONS` (which AI chat apps like Google Gemini set only to suppress
+     * English red spellcheck underlines). Strictly disabled in passwords, numbers, phones & emails.
+     */
+    private fun canPredictZh(): Boolean =
+        kbPrefs.postCommitPredict && scene.kind !in setOf(FieldKind.PASSWORD, FieldKind.NUMBER, FieldKind.PHONE, FieldKind.EMAIL)
+
     private fun recordChineseCommit(prevZh: String?, committed: String) {
         AiRanker.remember(committed)
         if (scene.learn) {
@@ -995,8 +1014,7 @@ class ImeService : InputMethodService(),
         }
         aiNextPredictions = emptyList()
         aiPredictContext = ""
-        showZhPredictions = kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD &&
-            committed.isNotEmpty() && ChinesePredictor.isCjk(committed.last())
+        showZhPredictions = canPredictZh() && committed.isNotEmpty() && ChinesePredictor.isCjk(committed.last())
         if (showZhPredictions && !zhComposing) {
             scheduleAiPredict(lastCommittedZhContext)
         }
@@ -1067,7 +1085,7 @@ class ImeService : InputMethodService(),
             commitFormatted(ic, text)
             resetZhLearningChain()
             showNextPredictions = false
-            if (chinese && text in setOf("，", "、") && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD) {
+            if (chinese && text in setOf("，", "、") && canPredictZh()) {
                 AiRanker.remember(text)
                 val rawBefore = ic.getTextBeforeCursor(48, 0)?.toString().orEmpty()
                 val fullCtx = if (rawBefore.endsWith(text)) rawBefore else (rawBefore + text).takeLast(48)
@@ -1553,7 +1571,7 @@ class ImeService : InputMethodService(),
             scene.kind == FieldKind.URL && !chinese && urlSuggestions(labels, commits) -> {
                 keepToolbarEdges = labels.isNotEmpty()
             }
-            chinese && showZhPredictions && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD && overlay == Overlay.NONE -> {
+            chinese && showZhPredictions && canPredictZh() && overlay == Overlay.NONE -> {
                 val icBefore = currentInputConnection?.getTextBeforeCursor(48, 0)?.toString().orEmpty()
                 val before = if (icBefore.isNotEmpty() && (lastCommittedZhContext.isEmpty() || icBefore.last() == lastCommittedZhContext.last())) {
                     icBefore
@@ -2132,7 +2150,7 @@ class ImeService : InputMethodService(),
         triggerHaptic()
         if (hwComposing) hwCommitTop()
         currentInputConnection?.commitText(punct, 1)
-        if (punct in setOf("，", "、") && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD) {
+        if (punct in setOf("，", "、") && canPredictZh()) {
             AiRanker.remember(punct)
             val rawBefore = currentInputConnection?.getTextBeforeCursor(48, 0)?.toString().orEmpty()
             val fullCtx = if (rawBefore.endsWith(punct)) rawBefore else (rawBefore + punct).takeLast(48)

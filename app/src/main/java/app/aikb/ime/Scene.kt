@@ -81,9 +81,20 @@ data class Scene(
                         InputType.TYPE_TEXT_VARIATION_URI ->
                             Scene(FieldKind.URL, action, true, false, false, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_PASSWORD,
-                        InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD,
-                        InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ->
+                        InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD ->
                             Scene(FieldKind.PASSWORD, action, false, false, false, false, rawAction = rawAction)
+                        InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ->
+                            if (multiLine) {
+                                // Flutter / Compose multi-line chat boxes (e.g. AI chat apps) set
+                                // `VISIBLE_PASSWORD | MULTI_LINE` when disabling English spellcheck;
+                                // real password fields are never multi-line.
+                                Scene(
+                                    FieldKind.TEXT, action, suggestions = true, autoCorrect = false,
+                                    autoCaps = caps, learn = !incognito, rawAction = rawAction, multiLine = true,
+                                )
+                            } else {
+                                Scene(FieldKind.PASSWORD, action, false, false, false, false, rawAction = rawAction)
+                            }
                         InputType.TYPE_TEXT_VARIATION_PERSON_NAME ->
                             Scene(FieldKind.PERSON_NAME, action, !noSuggest, false, true, !incognito, rawAction = rawAction)
                         InputType.TYPE_TEXT_VARIATION_FILTER ->
