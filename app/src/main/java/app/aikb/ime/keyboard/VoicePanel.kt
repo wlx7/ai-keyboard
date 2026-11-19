@@ -3,23 +3,19 @@ package app.aikb.ime.keyboard
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
-import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.view.MotionEvent
 import android.view.View
 import androidx.core.content.ContextCompat
+import app.aikb.ime.engine.OfflineAsrEngine
 
 /**
- * Offline-first voice input panel embedded inside the keyboard stack.
- * Uses Android's system SpeechRecognizer with EXTRA_PREFER_OFFLINE = true (the app itself holds
- * NO INTERNET permission). Also offers one-tap handoff to an installed system voice IME if present.
+ * 100% built-in offline neural voice input panel (`sherpa-onnx` streaming Zipformer int8).
+ * Works across all domestic and international Android devices with ZERO internet permission
+ * and ZERO dependency on Google or vendor cloud speech services.
  */
 @SuppressLint("ViewConstructor")
 class VoicePanel(context: Context, private val listener: Listener) : View(context) {
@@ -30,8 +26,6 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
         fun onVoiceDelete()
         fun onVoiceClose()
         fun onVoiceRequestPermission()
-        fun hasSystemVoiceIme(): Boolean
-        fun onSwitchSystemVoiceIme()
     }
 
     private val dp = resources.displayMetrics.density
@@ -39,7 +33,6 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
     var theme: KbTheme = KbTheme.of(context)
         set(v) { field = v; invalidate() }
 
-    private var recognizer: SpeechRecognizer? = null
     private var listening = false
     private var rmsLevel = 0f
     private var statusText = "点击麦克风开始说话"
@@ -47,10 +40,12 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
 
     private val micRect = RectF()
     private val backRect = RectF()
-    private val sysVoiceRect = RectF()
+    private val commaRect = RectF()
+    private val periodRect = RectF()
+    private val questRect = RectF()
     private val delRect = RectF()
 
-    private var pressedBtn = 0 // 1=mic, 2=back, 3=sysVoice, 4=del
+    private var pressedBtn = 0 // 1=mic, 2=back, 3=comma, 4=del, 5=period, 6=quest
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -61,13 +56,43 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
     private fun hasMicPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
+    private val asrCallback = object : OfflineAsrEngine.Callback {
+        override fun onState(listening: Boolean, status: String) {
+            this@VoicePanel.listening = listening
+            this@VoicePanel.statusText = status
+            invalidate()
+        }
+
+        override fun onRms(level: Float) {
+            this@VoicePanel.rmsLevel = level
+            if (listening) invalidate()
+        }
+
+        override fun onPartial(text: String) {
+            previewText = text
+            listener.onVoicePartial(text)
+            invalidate()
+        }
+
+        override fun onFinal(text: String) {
+            previewText = ""
+            listener.onVoicePartial("")
+            if (text.isNotEmpty()) {
+                listener.onVoiceCommit(text)
+                statusText = "已上屏，请继续说话…"
+            }
+            invalidate()
+        }
+    }
+
     fun onShown() {
         previewText = ""
         rmsLevel = 0f
         if (!hasMicPermission()) {
             listening = false
-            statusText = "点击下方麦克风授权录音（本应用无联网权限）"
+            statusText = "请授予麦克风录音权限（纯本地离线识别，不联网）"
             invalidate()
+            listener.onVoiceRequestPermission()
         } else {
             startListening()
         }
@@ -76,13 +101,9 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
     fun stopAndRelease() {
         listening = false
         rmsLevel = 0f
+        previewText = ""
+        OfflineAsrEngine.stop()
         listener.onVoicePartial("")
-        runCatching {
-            recognizer?.stopListening()
-            recognizer?.cancel()
-            recognizer?.destroy()
-        }
-        recognizer = null
         invalidate()
     }
 
@@ -91,110 +112,30 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
             listener.onVoiceRequestPermission()
             return
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            listening = false
-            statusText = if (listener.hasSystemVoiceIme()) {
-                "未检测到系统语音服务，可点下方切换系统语音输入"
-            } else {
-                "当前系统未安装本地语音识别服务"
-            }
-            invalidate()
-            return
-        }
-        runCatching {
-            if (recognizer == null) {
-                recognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-                    setRecognitionListener(recListener)
-                }
-            }
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            }
-            previewText = ""
-            statusText = "正在聆听（离线优先）…"
-            listening = true
-            recognizer?.startListening(intent)
-        }.onFailure {
-            listening = false
-            statusText = "语音引擎启动失败，请检查系统语音服务"
-        }
+        previewText = ""
+        OfflineAsrEngine.start(context, asrCallback)
         invalidate()
-    }
-
-    private val recListener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            listening = true
-            statusText = "请说话…"
-            invalidate()
-        }
-        override fun onBeginningOfSpeech() {
-            statusText = "正在识别…"
-            invalidate()
-        }
-        override fun onRmsChanged(rmsdB: Float) {
-            rmsLevel = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
-            invalidate()
-        }
-        override fun onBufferReceived(buffer: ByteArray?) = Unit
-        override fun onEndOfSpeech() {
-            listening = false
-            rmsLevel = 0f
-            statusText = "正在处理…"
-            invalidate()
-        }
-        override fun onError(error: Int) {
-            listening = false
-            rmsLevel = 0f
-            listener.onVoicePartial("")
-            statusText = when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "未听清，轻触麦克风重试"
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "需要麦克风权限，轻触授权"
-                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
-                    "系统语音需下载离线语音包（设置 → 系统语音）"
-                else -> "识别已暂停，轻触麦克风继续"
-            }
-            invalidate()
-        }
-        override fun onResults(results: Bundle?) {
-            listening = false
-            rmsLevel = 0f
-            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val out = list?.firstOrNull()?.trim().orEmpty()
-            previewText = ""
-            listener.onVoicePartial("")
-            if (out.isNotEmpty()) {
-                listener.onVoiceCommit(out)
-                statusText = "已输入，轻触麦克风继续说话"
-            } else {
-                statusText = "轻触麦克风继续说话"
-            }
-            invalidate()
-        }
-        override fun onPartialResults(partialResults: Bundle?) {
-            val part = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.trim().orEmpty()
-            if (part.isNotEmpty()) {
-                previewText = part
-                listener.onVoicePartial(part)
-                invalidate()
-            }
-        }
-        override fun onEvent(eventType: Int, params: Bundle?) = Unit
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         val cx = w / 2f
-        val cy = h * 0.50f
+        val cy = h * 0.48f
         val r = 32 * dp
         micRect.set(cx - r, cy - r, cx + r, cy + r)
 
         val barTop = h - 44 * dp
         val barBot = h - 6 * dp
         backRect.set(10 * dp, barTop, 88 * dp, barBot)
-        sysVoiceRect.set(cx - 58 * dp, barTop, cx + 58 * dp, barBot)
-        delRect.set(w - 76 * dp, barTop, w - 10 * dp, barBot)
+        delRect.set(w - 72 * dp, barTop, w - 10 * dp, barBot)
+
+        // Quick punctuation pills in the middle (`，`  `。`  `？`)
+        val pw = 42 * dp
+        val gap = 8 * dp
+        val totalP = pw * 3 + gap * 2
+        val pStart = (w - totalP) / 2f
+        commaRect.set(pStart, barTop, pStart + pw, barBot)
+        periodRect.set(pStart + pw + gap, barTop, pStart + pw * 2 + gap, barBot)
+        questRect.set(pStart + (pw + gap) * 2, barTop, pStart + pw * 3 + gap * 2, barBot)
     }
 
     override fun onDraw(c: Canvas) {
@@ -202,7 +143,7 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
         val u = minOf(sp, dp * 1.12f)
         val cx = width / 2f
 
-        // Status / live transcript line
+        // Status / live streaming transcript line
         text.textSize = 14.5f * u
         text.color = if (previewText.isNotEmpty()) theme.text else theme.textSecondary
         val shown = previewText.ifEmpty { statusText }
@@ -210,33 +151,31 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
         val line = if (text.measureText(shown) > maxW) "…" + shown.takeLast(22) else shown
         c.drawText(line, cx, 28 * dp, text)
 
-        // Pulsing ring + mic button
+        // Pulsing audio ring + mic button
         val mcx = micRect.centerX()
         val mcy = micRect.centerY()
         val baseR = micRect.width() / 2f
         if (listening) {
-            fill.color = (theme.accent and 0x00FFFFFF) or 0x26000000
-            c.drawCircle(mcx, mcy, baseR * (1.18f + 0.32f * rmsLevel), fill)
+            fill.color = (theme.accent and 0x00FFFFFF) or 0x28000000
+            c.drawCircle(mcx, mcy, baseR * (1.16f + 0.36f * rmsLevel), fill)
         }
         fill.color = if (listening) theme.accent else if (pressedBtn == 1) theme.keyPressed else theme.key
         c.drawCircle(mcx, mcy, baseR, fill)
         val micFg = if (listening) theme.accentText else theme.accent
         KeyDraw.drawMicIcon(c, mcx, mcy, 28 * dp, micFg, stroke, dp)
 
-        // Bottom controls: 返回键盘 | [系统语音] | ⌫
-        fill.color = if (pressedBtn == 2) theme.funcKeyPressed else theme.funcKey
-        c.drawRoundRect(backRect, 7 * dp, 7 * dp, fill)
-        KeyDraw.drawKeyText(c, "返回键盘", backRect, 13.5f * u, theme.text, text, dp)
+        // Bottom controls: 返回键盘 | ， 。 ？ | ⌫
+        drawSmallBtn(c, backRect, "返回键盘", pressedBtn == 2, 13.5f * u)
+        drawSmallBtn(c, commaRect, "，", pressedBtn == 3, 16f * u)
+        drawSmallBtn(c, periodRect, "。", pressedBtn == 5, 16f * u)
+        drawSmallBtn(c, questRect, "？", pressedBtn == 6, 16f * u)
+        drawSmallBtn(c, delRect, "⌫", pressedBtn == 4, 16f * u)
+    }
 
-        if (listener.hasSystemVoiceIme()) {
-            fill.color = if (pressedBtn == 3) theme.funcKeyPressed else theme.funcKey
-            c.drawRoundRect(sysVoiceRect, 7 * dp, 7 * dp, fill)
-            KeyDraw.drawKeyText(c, "系统语音输入", sysVoiceRect, 13.0f * u, theme.text, text, dp)
-        }
-
-        fill.color = if (pressedBtn == 4) theme.funcKeyPressed else theme.funcKey
-        c.drawRoundRect(delRect, 7 * dp, 7 * dp, fill)
-        KeyDraw.drawKeyText(c, "⌫", delRect, 16 * u, theme.text, text, dp)
+    private fun drawSmallBtn(c: Canvas, r: RectF, label: String, pressed: Boolean, sizePx: Float) {
+        fill.color = if (pressed) theme.funcKeyPressed else theme.funcKey
+        c.drawRoundRect(r, 7 * dp, 7 * dp, fill)
+        KeyDraw.drawKeyText(c, label, r, sizePx, theme.text, text, dp)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -251,12 +190,15 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
                 if (up == pressedBtn) {
                     when (up) {
                         1 -> if (listening) {
-                            runCatching { recognizer?.stopListening() }
+                            OfflineAsrEngine.stop()
                             listening = false
+                            statusText = "已暂停，轻触麦克风继续说话"
                             invalidate()
                         } else startListening()
                         2 -> { stopAndRelease(); listener.onVoiceClose() }
-                        3 -> if (listener.hasSystemVoiceIme()) { stopAndRelease(); listener.onSwitchSystemVoiceIme() }
+                        3 -> { flushAndCommitPunct("，") }
+                        5 -> { flushAndCommitPunct("。") }
+                        6 -> { flushAndCommitPunct("？") }
                         4 -> listener.onVoiceDelete()
                     }
                 }
@@ -268,10 +210,23 @@ class VoicePanel(context: Context, private val listener: Listener) : View(contex
         return true
     }
 
+    private fun flushAndCommitPunct(p: String) {
+        if (previewText.isNotEmpty()) {
+            val pending = previewText
+            previewText = ""
+            listener.onVoicePartial("")
+            listener.onVoiceCommit(pending + p)
+        } else {
+            listener.onVoiceCommit(p)
+        }
+    }
+
     private fun hit(x: Float, y: Float): Int = when {
         micRect.contains(x, y) -> 1
         backRect.contains(x, y) -> 2
-        listener.hasSystemVoiceIme() && sysVoiceRect.contains(x, y) -> 3
+        commaRect.contains(x, y) -> 3
+        periodRect.contains(x, y) -> 5
+        questRect.contains(x, y) -> 6
         delRect.contains(x, y) -> 4
         else -> 0
     }

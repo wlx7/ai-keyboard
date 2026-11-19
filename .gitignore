@@ -9,8 +9,9 @@ local.properties
 /third_party/
 # native build intermediates
 .cxx/
-# generated from tools/data by tools/build_rime_data.sh (52 MB of third-party data)
+# generated from tools/data by tools/build_rime_data.sh & tools/fetch_sherpa.sh
 /app/src/main/assets/rime/
+/app/src/main/assets/asr/
 /tools/distill/.venv/
 __pycache__/
 *.pyc

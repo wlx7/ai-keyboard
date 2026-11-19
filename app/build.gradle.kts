@@ -13,8 +13,8 @@ android {
         applicationId = "app.aikb.ime"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.0.0"
+        versionCode = 7
+        versionName = "1.1.0"
         externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=c++_static") } }
     }
 
@@ -60,6 +60,7 @@ android {
 }
 
 dependencies {
+    implementation(files("../third_party/sherpa-onnx/sherpa-onnx.aar"))
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))

@@ -130,8 +130,8 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
 
     private fun updateToolbarRects(w: Float, h: Float) {
         menuRect.set(4 * dp, 4 * dp, 44 * dp, h - 4 * dp)
-        hwRect.set(48 * dp, 4 * dp, 90 * dp, h - 4 * dp)
-        clipRect.set(94 * dp, 4 * dp, 136 * dp, h - 4 * dp)
+        hwRect.set(48 * dp, 5 * dp, 114 * dp, h - 5 * dp)
+        clipRect.set(118 * dp, 4 * dp, 160 * dp, h - 4 * dp)
         hideRect.set(w - 44 * dp, 4 * dp, w - 4 * dp, h - 4 * dp)
         voiceRect.set(w - 88 * dp, 4 * dp, w - 46 * dp, h - 4 * dp)
     }
@@ -253,17 +253,26 @@ class CandidateBar(context: Context, private val onPick: (Int) -> Unit) : View(c
             freshPasteRect.setEmpty()
             freshCloseRect.setEmpty()
 
-            // Quick Handwriting / Keyboard toggle
-            if (pressedToolbar == ToolbarAction.HANDWRITING_TOGGLE || handwritingActive) {
-                fill.color = if (handwritingActive) (theme.accent and 0x00FFFFFF) or 0x24000000 else theme.keyPressed
-                c.drawRoundRect(hwRect, 8 * dp, 8 * dp, fill)
+            // Quick Handwriting / Keyboard toggle pill with explicit "手写" / "键盘" label
+            fill.color = when {
+                handwritingActive -> (theme.accent and 0x00FFFFFF) or 0x26000000
+                pressedToolbar == ToolbarAction.HANDWRITING_TOGGLE -> theme.keyPressed
+                else -> (theme.funcKey and 0x00FFFFFF) or 0x55000000
             }
+            c.drawRoundRect(hwRect, 9 * dp, 9 * dp, fill)
             val hwColor = if (handwritingActive) theme.accent else theme.text
+            val iconX = hwRect.left + 14 * dp
             if (handwritingActive) {
-                KeyDraw.drawKeyboardIcon(c, hwRect.centerX(), cy, 20 * dp, hwColor, fill, stroke, dp)
+                KeyDraw.drawKeyboardIcon(c, iconX, cy, 16.5f * dp, hwColor, fill, stroke, dp)
             } else {
-                KeyDraw.drawHandwritingIcon(c, hwRect.centerX(), cy, 19 * dp, hwColor, stroke, path, dp)
+                KeyDraw.drawHandwritingIcon(c, iconX, cy, 16f * dp, hwColor, stroke, path, dp)
             }
+            val u = minOf(sp, dp * 1.12f)
+            paint.typeface = if (handwritingActive) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            paint.textSize = 13f * u
+            paint.color = hwColor
+            val fm = paint.fontMetrics
+            c.drawText(if (handwritingActive) "键盘" else "手写", hwRect.left + 42 * dp, cy - (fm.ascent + fm.descent) / 2f, paint)
 
             // Clipboard icon (+ small dot when items exist)
             if (pressedToolbar == ToolbarAction.CLIPBOARD) {

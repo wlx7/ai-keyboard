@@ -21,11 +21,13 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import app.aikb.ime.engine.AiRanker
+import app.aikb.ime.engine.ChinesePredictor
 import app.aikb.ime.engine.ClipboardStore
 import app.aikb.ime.engine.EnglishDictionary
 import app.aikb.ime.engine.EnglishEngine
 import app.aikb.ime.engine.EnglishResult
 import app.aikb.ime.engine.HandwritingEngine
+import app.aikb.ime.engine.OfflineAsrEngine
 import app.aikb.ime.engine.Rime
 import app.aikb.ime.engine.RimeEngine
 import app.aikb.ime.engine.T9
@@ -42,6 +44,7 @@ import app.aikb.ime.keyboard.KeyboardView
 import app.aikb.ime.keyboard.Layout
 import app.aikb.ime.keyboard.Layouts
 import app.aikb.ime.keyboard.Page
+import app.aikb.ime.keyboard.PreeditBar
 import app.aikb.ime.keyboard.PreviewOverlay
 import app.aikb.ime.keyboard.ShiftState
 import app.aikb.ime.keyboard.T9View
@@ -65,8 +68,10 @@ class ImeService : InputMethodService(),
     private lateinit var clipboardStore: ClipboardStore
     private var sysClipboard: ClipboardManager? = null
     private var english: EnglishEngine? = null
+    private var zhPredictor: ChinesePredictor? = null
 
     private lateinit var root: FrameLayout
+    private lateinit var preeditBar: PreeditBar
     private lateinit var keyboard: KeyboardView
     private lateinit var candidates: CandidateBar
     private lateinit var emoji: EmojiPanel
@@ -96,6 +101,7 @@ class ImeService : InputMethodService(),
     private val composing = StringBuilder()
     private var result: EnglishResult? = null
     private var showNextPredictions = false
+    private var showZhPredictions = false
     private var shownCandidates: List<String> = emptyList()
     /** What each candidate commits (may differ from its label, e.g. quoted literal or domain tail). */
     private var candidateCommits: List<String> = emptyList()
@@ -140,15 +146,49 @@ class ImeService : InputMethodService(),
         }
     }
 
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (!::keyboard.isInitialized) return@OnSharedPreferenceChangeListener
+        when (key) {
+            KEY_HANDWRITING, KEY_SCHEMA, KEY_CHINESE -> {
+                if (!scene.forceEnglish) {
+                    chinese = prefs.getBoolean(KEY_CHINESE, true)
+                    handwritingMode = prefs.getBoolean(KEY_HANDWRITING, false) && chinese && page == Page.LETTERS
+                    if (handwritingMode) hwWorker.execute { HandwritingEngine.getOrLoad(applicationContext) }
+                    val sc = prefs.getString(KEY_SCHEMA, "rime_ice")
+                    if (chinese && !handwritingMode) {
+                        RimeEngine.start(this, sc)
+                        if (sc != null) RimeEngine.selectSchema(sc)
+                    }
+                    refreshLayout()
+                    updateCandidates()
+                }
+            }
+            KEY_TRADITIONAL -> {
+                RimeEngine.traditional = prefs.getBoolean(KEY_TRADITIONAL, false)
+                syncToolbarState()
+                updateCandidates()
+            }
+            "clear_history_at" -> {
+                history.clear()
+                zhPredictor?.clearUserHistory()
+                showNextPredictions = false
+                showZhPredictions = false
+                updateCandidates()
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        prefs.registerOnSharedPreferenceChangeListener(prefListener)
         history = UserHistory(filesDir.resolve("en_user.tsv"))
         clipboardStore = ClipboardStore(filesDir.resolve("clipboard_pinned.txt"))
         sysClipboard = (getSystemService(CLIPBOARD_SERVICE) as? ClipboardManager)?.also {
             runCatching { it.addPrimaryClipChangedListener(clipListener) }
         }
         english = runCatching { EnglishEngine(EnglishDictionary.load(this), history) }.getOrNull()
+        zhPredictor = runCatching { ChinesePredictor.load(this, filesDir.resolve("zh_user.tsv")) }.getOrNull()
         RimeEngine.addStateListener(rimeListener)
         RimeEngine.traditional = prefs.getBoolean(KEY_TRADITIONAL, false)
         AiRanker.alpha = prefs.getFloat(KEY_AI_ALPHA, AiRanker.DEFAULT_ALPHA)
@@ -157,8 +197,10 @@ class ImeService : InputMethodService(),
 
     override fun onDestroy() {
         uiHandler.removeCallbacks(clipTick)
+        prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
         runCatching { sysClipboard?.removePrimaryClipChangedListener(clipListener) }
         RimeEngine.removeStateListener(rimeListener)
+        OfflineAsrEngine.unload()
         aiWorker.shutdownNow()
         hwWorker.shutdownNow()
         super.onDestroy()
@@ -167,6 +209,7 @@ class ImeService : InputMethodService(),
     override fun onCreateInputView(): View {
         val theme = KbTheme.of(this)
         previewOverlay = PreviewOverlay(this)
+        preeditBar = PreeditBar(this).apply { visibility = View.GONE }
         keyboard = KeyboardView(this, this).also { it.previewOverlay = previewOverlay }
         candidates = CandidateBar(this) { pickCandidate(it) }.also { bar ->
             bar.onExpandToggle = { setOverlay(if (overlay == Overlay.CANDIDATES) Overlay.NONE else Overlay.CANDIDATES) }
@@ -192,6 +235,7 @@ class ImeService : InputMethodService(),
         }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            addView(preeditBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(candidates, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(stack, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
@@ -212,6 +256,7 @@ class ImeService : InputMethodService(),
     }
 
     private fun applyTheme(t: KbTheme) {
+        preeditBar.theme = t
         keyboard.theme = t; candidates.theme = t; emoji.theme = t; previewOverlay.theme = t
         candidatePanel.theme = t; toolPanel.theme = t; clipboardPanel.theme = t; voicePanel.theme = t
         t9.theme = t; handwriting.theme = t
@@ -225,13 +270,19 @@ class ImeService : InputMethodService(),
         loadSettings()
         applyTheme(KbTheme.of(this))
         scene = Scene.of(info)
-        chinese = prefs.getBoolean(KEY_CHINESE, true) && !scene.forceEnglish
-        if (scene.forceEnglish || scene.initialPage != Page.LETTERS) handwritingMode = false
-        else handwritingMode = prefs.getBoolean(KEY_HANDWRITING, false) && chinese
+        chinese = when {
+            scene.forceEnglish -> false
+            scene.preferEnglishOnStart -> false
+            else -> prefs.getBoolean(KEY_CHINESE, true)
+        }
+        handwritingMode = if (scene.forceEnglish || scene.initialPage != Page.LETTERS) false
+        else prefs.getBoolean(KEY_HANDWRITING, false) && chinese
         if (handwritingMode) hwWorker.execute { HandwritingEngine.getOrLoad(applicationContext) }
         page = scene.initialPage
         shift = ShiftState.OFF
-        composing.clear(); result = null; lastAutoCorrect = null; showNextPredictions = false
+        composing.clear(); result = null; lastAutoCorrect = null
+        showNextPredictions = false; showZhPredictions = false
+        preeditBar.text = ""
         hwCandidates = emptyList()
         if (::handwriting.isInitialized) { handwriting.clearCanvas(notify = false); handwriting.hasPendingComposition = false }
         val savedSchema = prefs.getString(KEY_SCHEMA, "rime_ice")
@@ -252,13 +303,16 @@ class ImeService : InputMethodService(),
         super.onFinishInputView(finishingInput)
         uiHandler.removeCallbacks(clipTick)
         if (::voicePanel.isInitialized) voicePanel.stopAndRelease()
+        if (::preeditBar.isInitialized) preeditBar.text = ""
         if (::handwriting.isInitialized) { handwriting.clearCanvas(notify = false); handwriting.hasPendingComposition = false }
         hwCandidates = emptyList()
+        showZhPredictions = false
         if (composing.isNotEmpty()) { currentInputConnection?.finishComposingText(); composing.clear() }
         if (zhComposing) { RimeEngine.clear(); zh = EMPTY_ZH; currentInputConnection?.finishComposingText() }
         if (::keyboard.isInitialized) keyboard.cancelAll()
         setOverlay(Overlay.NONE)
         history.save()
+        zhPredictor?.save()
         prefs.edit().putFloat(KEY_AI_ALPHA, AiRanker.alpha).apply()
         aiSuggestion = null
     }
@@ -279,6 +333,7 @@ class ImeService : InputMethodService(),
         if (composing.isEmpty() && !zhComposing) {
             if (!stale && oldSelStart >= 0 && kotlin.math.abs(newSelStart - oldSelStart) > 2) {
                 showNextPredictions = false
+                showZhPredictions = false
                 updateCandidates()
             }
             updateAutoShift()
@@ -443,7 +498,7 @@ class ImeService : InputMethodService(),
             CandidateBar.ToolbarAction.MENU -> {
                 if (zhComposing) zhCommitTop()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-                showNextPredictions = false
+                showNextPredictions = false; showZhPredictions = false
                 updateCandidates()
                 setOverlay(if (overlay in setOf(Overlay.TOOLS, Overlay.CLIPBOARD, Overlay.VOICE)) Overlay.NONE else Overlay.TOOLS)
             }
@@ -451,7 +506,7 @@ class ImeService : InputMethodService(),
             CandidateBar.ToolbarAction.CLIPBOARD -> {
                 if (zhComposing) zhCommitTop()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-                showNextPredictions = false
+                showNextPredictions = false; showZhPredictions = false
                 updateCandidates()
                 setOverlay(if (overlay == Overlay.CLIPBOARD) Overlay.NONE else Overlay.CLIPBOARD)
             }
@@ -468,7 +523,7 @@ class ImeService : InputMethodService(),
             CandidateBar.ToolbarAction.VOICE -> {
                 if (zhComposing) zhCommitTop()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-                showNextPredictions = false
+                showNextPredictions = false; showZhPredictions = false
                 updateCandidates()
                 setOverlay(if (overlay == Overlay.VOICE) Overlay.NONE else Overlay.VOICE)
             }
@@ -483,7 +538,7 @@ class ImeService : InputMethodService(),
         if (zhComposing) zhCommitTop()
         if (hwComposing) hwCommitTop()
         if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
-        showNextPredictions = false
+        showNextPredictions = false; showZhPredictions = false
         handwritingMode = !handwritingMode
         if (handwritingMode) {
             chinese = true
@@ -584,8 +639,14 @@ class ImeService : InputMethodService(),
     override fun onClipboardClose() = setOverlay(Overlay.NONE)
 
     override fun onVoiceCommit(text: String) {
-        currentInputConnection?.finishComposingText()
-        currentInputConnection?.commitText(text, 1)
+        val ic = currentInputConnection ?: return
+        ic.finishComposingText()
+        val prevZh = trailingZhWordBeforeCursor()
+        ic.commitText(text, 1)
+        if (text.any(ChinesePredictor::isCjk)) {
+            recordChineseCommit(prevZh, text)
+            updateCandidates()
+        }
     }
 
     override fun onVoicePartial(text: String) {
@@ -595,7 +656,10 @@ class ImeService : InputMethodService(),
 
     override fun onVoiceDelete() = onDeleteDown(false)
 
-    override fun onVoiceClose() = setOverlay(Overlay.NONE)
+    override fun onVoiceClose() {
+        setOverlay(Overlay.NONE)
+        updateCandidates()
+    }
 
     override fun onVoiceRequestPermission() {
         requestHideSelf(0)
@@ -606,28 +670,21 @@ class ImeService : InputMethodService(),
         )
     }
 
-    override fun hasSystemVoiceIme(): Boolean = findSystemVoiceIme() != null
-
-    override fun onSwitchSystemVoiceIme() {
-        val id = findSystemVoiceIme() ?: return
-        setOverlay(Overlay.NONE)
-        if (Build.VERSION.SDK_INT >= 28) switchInputMethod(id)
-        else (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+    /** Captures the trailing Chinese word right before the cursor (up to 4 CJK chars) for bigram learning. */
+    private fun trailingZhWordBeforeCursor(skipSuffixLen: Int = 0): String? {
+        val raw = currentInputConnection?.getTextBeforeCursor(8 + skipSuffixLen, 0)?.toString() ?: return null
+        val before = if (skipSuffixLen > 0 && raw.length >= skipSuffixLen) raw.dropLast(skipSuffixLen) else raw
+        if (before.isEmpty()) return null
+        var i = before.length
+        while (i > 0 && ChinesePredictor.isCjk(before[i - 1]) && before.length - i < 4) i--
+        return before.substring(i).takeIf { it.isNotEmpty() }
     }
 
-    private fun findSystemVoiceIme(): String? {
-        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-        for (imi in imm.enabledInputMethodList) {
-            if (imi.packageName == packageName) continue
-            val subtypes = imm.getEnabledInputMethodSubtypeList(imi, true)
-            if (subtypes.any { it.mode.equals("voice", ignoreCase = true) } ||
-                imi.serviceName.contains("voice", ignoreCase = true) ||
-                imi.id.contains("voice", ignoreCase = true)
-            ) {
-                return imi.id
-            }
-        }
-        return null
+    private fun recordChineseCommit(prevZh: String?, committed: String) {
+        AiRanker.remember(committed)
+        if (scene.learn) zhPredictor?.learn(prevZh, committed)
+        showZhPredictions = scene.suggestions && scene.kind != FieldKind.PASSWORD &&
+            committed.isNotEmpty() && ChinesePredictor.isCjk(committed.last())
     }
 
     // ------------------------------------------------------------------ keyboard callbacks
@@ -664,6 +721,7 @@ class ImeService : InputMethodService(),
         if (composes) {
             composing.append(text)
             showNextPredictions = false
+            showZhPredictions = false
             ic.setComposingText(composing, 1)
             if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
         } else {
@@ -673,15 +731,25 @@ class ImeService : InputMethodService(),
             }
             ic.commitText(text, 1)
             showNextPredictions = false
+            showZhPredictions = false
             if (shift == ShiftState.ONCE && page == Page.LETTERS) setShift(ShiftState.OFF)
             if (text.length == 1 && text[0] in ".?!。？！") updateAutoShift()
         }
         updateCandidates()
     }
 
-    private fun usesComposing(): Boolean =
-        if (chinese) !RimeEngine.isReady
-        else scene.suggestions && (scene.kind == FieldKind.TEXT || scene.kind == FieldKind.PERSON_NAME)
+    private fun usesComposing(): Boolean {
+        if (chinese) return !RimeEngine.isReady
+        if (!scene.suggestions) return false
+        return when (scene.kind) {
+            FieldKind.TEXT, FieldKind.PERSON_NAME, FieldKind.URL -> true
+            FieldKind.EMAIL -> {
+                val before = currentInputConnection?.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+                '@' !in before.substringAfterLast(' ')
+            }
+            else -> false
+        }
+    }
 
     override fun onFunction(key: Key) {
         val ic = currentInputConnection
@@ -701,6 +769,7 @@ class ImeService : InputMethodService(),
             KeyType.ENTER -> {
                 lastAutoCorrect = null
                 showNextPredictions = false
+                showZhPredictions = false
                 if (hwComposing) { hwCommitTop(); return }
                 if (zhComposing) { zhCommitRaw(); return }
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
@@ -717,6 +786,7 @@ class ImeService : InputMethodService(),
                 if (zhComposing) zhCommitRaw()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
                 showNextPredictions = false
+                showZhPredictions = false
                 chinese = !chinese
                 if (!chinese) handwritingMode = false
                 prefs.edit().putBoolean(KEY_CHINESE, chinese).apply()
@@ -728,6 +798,7 @@ class ImeService : InputMethodService(),
                 if (zhComposing) zhCommitTop()
                 if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
                 showNextPredictions = false
+                showZhPredictions = false
                 setOverlay(Overlay.EMOJI)
             }
             else -> Unit
@@ -754,6 +825,7 @@ class ImeService : InputMethodService(),
             if (aiSuggestion != null) commitAi() else zhKey(Rime.XK_SPACE)
             return
         }
+        showZhPredictions = false
         if (composing.isNotEmpty()) {
             if (chinese) {
                 commitComposing(useAutoCorrect = false)
@@ -763,12 +835,12 @@ class ImeService : InputMethodService(),
                 val committed = commitComposing(useAutoCorrect = true)
                 ic.commitText(" ", 1)
                 if (committed != typed) lastAutoCorrect = typed to committed
-                showNextPredictions = scene.suggestions && scene.kind == FieldKind.TEXT
+                showNextPredictions = scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)
             }
         } else {
             lastAutoCorrect = null
             val before = ic.getTextBeforeCursor(2, 0)?.toString().orEmpty()
-            if (doubleSpacePeriod && !chinese && now - lastSpaceAt < 450 && before.length == 2 &&
+            if (doubleSpacePeriod && !chinese && scene.kind == FieldKind.TEXT && now - lastSpaceAt < 450 && before.length == 2 &&
                 before[1] == ' ' && before[0].isLetterOrDigit()
             ) {
                 ic.deleteSurroundingText(1, 0)
@@ -779,7 +851,7 @@ class ImeService : InputMethodService(),
                 return
             }
             ic.commitText(" ", 1)
-            showNextPredictions = !chinese && scene.suggestions && scene.kind == FieldKind.TEXT
+            showNextPredictions = !chinese && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)
         }
         lastSpaceAt = now
         if (page == Page.SYMBOLS || page == Page.SYMBOLS2) { page = Page.LETTERS; refreshLayout() }
@@ -799,6 +871,7 @@ class ImeService : InputMethodService(),
             return
         }
         showNextPredictions = false
+        showZhPredictions = false
         val undo = lastAutoCorrect
         lastAutoCorrect = null
         if (undo != null && !repeat) {
@@ -824,6 +897,7 @@ class ImeService : InputMethodService(),
         if (zhComposing) zhCommitRaw()
         if (composing.isNotEmpty()) commitComposing(useAutoCorrect = false)
         showNextPredictions = false
+        showZhPredictions = false
         val code = if (steps < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT
         repeat(kotlin.math.abs(steps)) { sendDownUpKeyEvents(code) }
         if (haptics) root.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
@@ -849,6 +923,13 @@ class ImeService : InputMethodService(),
 
     private fun updateCandidates() {
         if (!::candidates.isInitialized) return
+        if (::preeditBar.isInitialized) {
+            preeditBar.text = when {
+                zhComposing -> zhDisplay()
+                chinese && composing.isNotEmpty() -> composing.toString()
+                else -> ""
+            }
+        }
         val labels = ArrayList<String>()
         val commits = ArrayList<String>()
         var highlight = -1
@@ -881,13 +962,47 @@ class ImeService : InputMethodService(),
                 } else {
                     labels += typed; commits += typed; highlight = 0
                 }
-                r?.suggestions?.forEach { s ->
-                    if (s.text != typed && s.text != auto) { labels += s.text; commits += s.text }
+                if (scene.kind == FieldKind.URL) {
+                    val low = typed.lowercase()
+                    val rawBefore = currentInputConnection?.getTextBeforeCursor(32 + typed.length, 0)?.toString().orEmpty()
+                    val prefixBefore = if (rawBefore.endsWith(typed)) rawBefore.dropLast(typed.length) else rawBefore
+                    if (prefixBefore.isEmpty()) {
+                        if ("https".startsWith(low)) { labels += "https://"; commits += "https://" }
+                        if ("www".startsWith(low)) { labels += "www."; commits += "www." }
+                    }
+                    r?.suggestions?.forEach { s ->
+                        if (s.text != typed && s.text !in labels) { labels += s.text; commits += s.text }
+                    }
+                    if (' ' !in prefixBefore && '.' !in prefixBefore && low.length >= 2) {
+                        val dom = "$low.com"
+                        if (dom !in labels) {
+                            val ins = minOf(2, labels.size)
+                            labels.add(ins, dom); commits.add(ins, dom)
+                        }
+                    }
+                } else {
+                    r?.suggestions?.forEach { s ->
+                        if (s.text != typed && s.text != auto) { labels += s.text; commits += s.text }
+                    }
                 }
             }
-            scene.kind == FieldKind.EMAIL -> emailSuggestions(labels, commits)
-            scene.kind == FieldKind.URL -> urlSuggestions(labels, commits)
-            !chinese && showNextPredictions && scene.suggestions && scene.kind == FieldKind.TEXT && overlay == Overlay.NONE -> {
+            scene.kind == FieldKind.EMAIL && !chinese -> {
+                emailSuggestions(labels, commits)
+                keepToolbarEdges = labels.isNotEmpty()
+            }
+            scene.kind == FieldKind.URL && !chinese && urlSuggestions(labels, commits) -> {
+                keepToolbarEdges = labels.isNotEmpty()
+            }
+            chinese && showZhPredictions && scene.suggestions && scene.kind != FieldKind.PASSWORD && overlay == Overlay.NONE -> {
+                val before = currentInputConnection?.getTextBeforeCursor(8, 0)?.toString().orEmpty()
+                var nexts = zhPredictor?.predict(before, max = 8).orEmpty()
+                if (RimeEngine.traditional && nexts.isNotEmpty()) {
+                    nexts = nexts.map { HandwritingEngine.toTraditional(this, it) }.distinct()
+                }
+                for (w in nexts) { labels += w; commits += w }
+                keepToolbarEdges = labels.isNotEmpty()
+            }
+            !chinese && showNextPredictions && scene.suggestions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL) && overlay == Overlay.NONE -> {
                 val prev = prevEnglishWord()
                 val nexts = english?.predictNext(prev, capitalizeFirst = shift != ShiftState.OFF, max = 6).orEmpty()
                 for (w in nexts) { labels += w; commits += w }
@@ -896,7 +1011,7 @@ class ImeService : InputMethodService(),
         }
         if (!scene.suggestions && !chinese) { labels.clear(); commits.clear(); highlight = -1; keepToolbarEdges = false }
         if (labels.isEmpty() && chinese && RimeEngine.state == RimeEngine.State.DEPLOYING) {
-            labels += "正在准备中文词库（仅首次）…"; commits += ""
+            labels += "正在准备中文词库…"; commits += ""
         }
         shownCandidates = labels
         candidateCommits = commits
@@ -910,23 +1025,29 @@ class ImeService : InputMethodService(),
         val before = currentInputConnection?.getTextBeforeCursor(64, 0)?.toString() ?: return
         val token = before.substringAfterLast(' ')
         val at = token.lastIndexOf('@')
-        if (at < 0) {
-            if (token.isNotEmpty()) { labels += "@"; commits += "@" }
-            return
-        }
+        if (at < 0) return
         val typedDomain = token.substring(at + 1).lowercase()
         for (d in EMAIL_DOMAINS) if (d.startsWith(typedDomain) && d != typedDomain) {
             labels += "@$d"; commits += d.substring(typedDomain.length)
         }
     }
 
-    private fun urlSuggestions(labels: MutableList<String>, commits: MutableList<String>) {
-        val before = currentInputConnection?.getTextBeforeCursor(64, 0)?.toString() ?: return
-        if (before.isEmpty()) {
-            for (s in listOf("https://", "www.", "http://")) { labels += s; commits += s }
-        } else if (!before.endsWith("/") && before.substringAfterLast('/').let { it.isNotEmpty() && '.' !in it }) {
-            for (s in listOf(".com", ".cn", ".net", ".org")) { labels += s; commits += s }
+    /** Populates domain suffix chips ONLY immediately after `.` or `:`, leaving the toolbar visible when empty. */
+    private fun urlSuggestions(labels: MutableList<String>, commits: MutableList<String>): Boolean {
+        val before = currentInputConnection?.getTextBeforeCursor(64, 0)?.toString() ?: return false
+        if (before.isEmpty() || ' ' in before) return false
+        if (before == "https:" || before == "http:") {
+            labels += "//"; commits += "//"
+            return true
         }
+        val hostPart = before.substringAfter("://").substringBefore('/')
+        if (before.endsWith(".") && hostPart.length >= 2) {
+            for (tld in listOf("com", "cn", "net", "org", "com.cn", "io")) {
+                labels += ".$tld"; commits += tld
+            }
+            return true
+        }
+        return false
     }
 
     private fun pickCandidate(index: Int) {
@@ -957,10 +1078,18 @@ class ImeService : InputMethodService(),
             if (scene.spaceAfterPick && !chinese) {
                 ic.commitText(" ", 1)
                 showNextPredictions = scene.suggestions && scene.kind == FieldKind.TEXT
+            } else if (!chinese && scene.kind == FieldKind.URL && !text.endsWith(".") && !text.endsWith("/")) {
+                // Allow English search phrase continuation if user hits space or let URL stay clean
+                showNextPredictions = false
             }
-        } else if (!chinese && showNextPredictions && scene.kind == FieldKind.TEXT) {
+        } else if (chinese && showZhPredictions) {
+            val prevZh = trailingZhWordBeforeCursor()
+            ic.commitText(text, 1)
+            recordChineseCommit(prevZh, text)
+        } else if (!chinese && showNextPredictions && scene.kind in setOf(FieldKind.TEXT, FieldKind.URL)) {
             val prev = prevEnglishWord()
-            ic.commitText("$text ", 1)
+            val suffix = if (scene.kind == FieldKind.TEXT) " " else " "
+            ic.commitText(text + suffix, 1)
             if (scene.learn) english?.learn(text, prevWord = prev)
             if (shift == ShiftState.ONCE) setShift(ShiftState.OFF)
             showNextPredictions = true
@@ -990,12 +1119,21 @@ class ImeService : InputMethodService(),
     private fun zhSync() {
         lastEditAt = SystemClock.uptimeMillis()
         val ic = currentInputConnection
+        val oldShownLen = if (zhComposing) zhDisplay().length else 0
         val commit = RimeEngine.takeCommit()
         zh = RimeEngine.snapshot()
-        if (commit != null) { ic?.commitText(commit, 1); AiRanker.remember(commit) }
+        if (commit != null) {
+            val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
+            ic?.commitText(commit, 1)
+            recordChineseCommit(prevZh, commit)
+        }
         if (zh.input != aiInput) aiSuggestion = null
-        if (zh.composing) ic?.setComposingText(zhDisplay(), 1)
-        else if (commit == null) ic?.commitText("", 1)
+        if (zh.composing) {
+            showZhPredictions = false
+            ic?.setComposingText(zhDisplay(), 1)
+        } else if (commit == null) {
+            ic?.commitText("", 1)
+        }
         updateCandidates()
         updateT9Side()
         scheduleAi()
@@ -1051,12 +1189,14 @@ class ImeService : InputMethodService(),
     private fun commitAi() {
         val text = aiSuggestion ?: return
         lastEditAt = SystemClock.uptimeMillis()
+        val oldShownLen = if (zhComposing) zhDisplay().length else 0
+        val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldShownLen)
         RimeEngine.clear()
         zh = EMPTY_ZH
         aiSuggestion = null
         currentInputConnection?.commitText(text, 1)
         AiRanker.feedback(pickedAi = true, pickedRime = false)
-        AiRanker.remember(text)
+        recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
         updateCandidates()
         updateT9Side()
@@ -1115,11 +1255,12 @@ class ImeService : InputMethodService(),
     override fun onHandwritingAutoCommitPrevious() {
         val top = hwCandidates.firstOrNull() ?: return
         lastEditAt = SystemClock.uptimeMillis()
+        val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = top.length)
         hwGen.incrementAndGet()
         hwCandidates = emptyList()
         handwriting.hasPendingComposition = false
         currentInputConnection?.commitText(top, 1)
-        AiRanker.remember(top)
+        recordChineseCommit(prevZh, top)
         updateCandidates()
     }
 
@@ -1127,6 +1268,7 @@ class ImeService : InputMethodService(),
         lastEditAt = SystemClock.uptimeMillis()
         hwGen.incrementAndGet()
         hwCandidates = emptyList()
+        showZhPredictions = false
         handwriting.hasPendingComposition = false
         currentInputConnection?.commitText("", 1)
         HandwritingEngine.getOrLoad(applicationContext)?.clearCache()
@@ -1136,7 +1278,9 @@ class ImeService : InputMethodService(),
     override fun onHandwritingPunct(punct: String) {
         if (haptics) root.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         if (hwComposing) hwCommitTop()
+        showZhPredictions = false
         currentInputConnection?.commitText(punct, 1)
+        updateCandidates()
     }
 
     override fun onHandwritingExitToKeyboard() {
@@ -1156,6 +1300,8 @@ class ImeService : InputMethodService(),
 
     private fun hwCommit(text: String) {
         lastEditAt = SystemClock.uptimeMillis()
+        val oldTopLen = hwCandidates.firstOrNull()?.length ?: 0
+        val prevZh = trailingZhWordBeforeCursor(skipSuffixLen = oldTopLen)
         hwGen.incrementAndGet()
         hwCandidates = emptyList()
         if (::handwriting.isInitialized) {
@@ -1163,7 +1309,7 @@ class ImeService : InputMethodService(),
             handwriting.hasPendingComposition = false
         }
         currentInputConnection?.commitText(text, 1)
-        AiRanker.remember(text)
+        recordChineseCommit(prevZh, text)
         setOverlay(Overlay.NONE)
         updateCandidates()
     }
@@ -1250,6 +1396,7 @@ class ImeService : InputMethodService(),
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
             aiWorker.execute { AiRanker.unload() }
             if (!handwritingMode) hwWorker.execute { HandwritingEngine.unload() }
+            if (overlay != Overlay.VOICE) OfflineAsrEngine.unload()
         }
     }
 

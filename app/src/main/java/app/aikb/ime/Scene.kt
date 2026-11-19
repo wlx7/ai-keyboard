@@ -32,9 +32,12 @@ data class Scene(
             else -> Page.LETTERS
         }
 
-    /** Chinese makes no sense in addresses and passwords; start those in English. */
+    /** Passwords strictly disable Chinese; emails start in English by default; browser URL/omnibox allows Chinese search! */
     val forceEnglish: Boolean
-        get() = kind == FieldKind.EMAIL || kind == FieldKind.URL || kind == FieldKind.PASSWORD
+        get() = kind == FieldKind.PASSWORD
+
+    val preferEnglishOnStart: Boolean
+        get() = kind == FieldKind.EMAIL || kind == FieldKind.PASSWORD
 
     /** Candidate taps append a space only in prose. */
     val spaceAfterPick: Boolean get() = kind == FieldKind.TEXT || kind == FieldKind.PERSON_NAME

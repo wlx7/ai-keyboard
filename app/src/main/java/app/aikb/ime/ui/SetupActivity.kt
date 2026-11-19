@@ -130,27 +130,53 @@ class SetupActivity : ComponentActivity() {
             Spacer(Modifier.height(24.dp))
             SectionTitle("中文输入方案")
             var schema by remember { mutableStateOf(prefs.getString(ImeService.KEY_SCHEMA, "rime_ice")!!) }
+            var handwritingSelected by remember { mutableStateOf(prefs.getBoolean(ImeService.KEY_HANDWRITING, false)) }
+            val modeOptions = remember {
+                buildList {
+                    RimeEngine.SCHEMAS.forEachIndexed { idx, pair ->
+                        add(pair)
+                        if (idx == 1) add("handwriting" to "手写输入（支持连写 / 叠写）")
+                    }
+                }
+            }
             Card {
-                RimeEngine.SCHEMAS.forEachIndexed { i, (id, name) ->
+                modeOptions.forEachIndexed { i, (id, name) ->
                     if (i > 0) Divider()
+                    val isChecked = if (id == "handwriting") handwritingSelected else (!handwritingSelected && id == schema)
                     Row(
                         Modifier.fillMaxWidth().clickable {
-                            schema = id
-                            prefs.edit().putString(ImeService.KEY_SCHEMA, id).apply()
+                            if (id == "handwriting") {
+                                handwritingSelected = true
+                                prefs.edit()
+                                    .putBoolean(ImeService.KEY_HANDWRITING, true)
+                                    .putBoolean(ImeService.KEY_CHINESE, true)
+                                    .apply()
+                            } else {
+                                handwritingSelected = false
+                                schema = id
+                                prefs.edit()
+                                    .putBoolean(ImeService.KEY_HANDWRITING, false)
+                                    .putBoolean(ImeService.KEY_CHINESE, true)
+                                    .putString(ImeService.KEY_SCHEMA, id)
+                                    .apply()
+                            }
                         }.padding(horizontal = 16.dp, vertical = 13.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(name, fontSize = 17.sp, color = MaterialTheme.colorScheme.onSurface, modifier = Modifier.weight(1f))
-                        if (id == schema) Text("✓", fontSize = 18.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                        if (isChecked) Text("✓", fontSize = 18.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
             Text(
-                "九宫格使用专用的 3×3 键盘，其余方案共用全键盘；切换后下次弹出键盘时生效。",
+                "也可随时点击键盘顶栏的「✍ 手写」或左上角「⊞」一键切换全拼、九宫格、手写、双拼与五笔。",
                 fontSize = 13.sp, color = Secondary(), modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp),
             )
             Spacer(Modifier.height(12.dp))
             Card { PrefSwitch(prefs, ImeService.KEY_TRADITIONAL, "输出繁体字", false) }
+
+            Spacer(Modifier.height(24.dp))
+            FuzzyPinyinSection(prefs)
 
             Spacer(Modifier.height(24.dp))
             AiSection(prefs)
@@ -174,7 +200,10 @@ class SetupActivity : ComponentActivity() {
             Card {
                 Row(
                     Modifier.fillMaxWidth().clickable {
-                        UserHistory(filesDir.resolve("en_user.tsv")).clear(); cleared = true
+                        UserHistory(filesDir.resolve("en_user.tsv")).clear()
+                        filesDir.resolve("zh_user.tsv").delete()
+                        prefs.edit().putLong("clear_history_at", System.currentTimeMillis()).apply()
+                        cleared = true
                     }.padding(horizontal = 16.dp, vertical = 14.dp)
                 ) {
                     Text(if (cleared) "已清除" else "清除已学习的词", color = Color(0xFFFF3B30), fontSize = 17.sp)
@@ -334,6 +363,103 @@ private fun AiSection(prefs: android.content.SharedPreferences) {
         (status?.let { "$it。" } ?: "") +
             "模型在手机本地运行，只在停顿时为长拼音挑选更合理的整句，并按你的选择自动微调权重。" +
             "应用不联网，请将模型文件（推荐专属蒸馏版 zh-lm-lingxi-285m-q4_0.gguf 约 155 MB，或轻量版 47 MB / 千问原版 397 MB）拷到手机后在此导入。",
+        fontSize = 13.sp, color = Secondary(), modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp),
+    )
+}
+
+@Composable
+private fun FuzzyPinyinSection(prefs: android.content.SharedPreferences) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var fuzzyOn by remember { mutableStateOf(prefs.getBoolean(RimeEngine.PREF_FUZZY_ENABLED, false)) }
+    var selected by remember {
+        mutableStateOf(prefs.getStringSet(RimeEngine.PREF_FUZZY_PAIRS, RimeEngine.COMMON_FUZZY_IDS)!!.toSet())
+    }
+    var rimeState by remember { mutableStateOf(RimeEngine.state) }
+
+    DisposableEffect(Unit) {
+        val cb = { rimeState = RimeEngine.state }
+        RimeEngine.addStateListener(cb)
+        onDispose { RimeEngine.removeStateListener(cb) }
+    }
+
+    fun applyFuzzy(nextOn: Boolean, nextSet: Set<String>) {
+        fuzzyOn = nextOn
+        selected = nextSet
+        prefs.edit()
+            .putBoolean(RimeEngine.PREF_FUZZY_ENABLED, nextOn)
+            .putStringSet(RimeEngine.PREF_FUZZY_PAIRS, HashSet(nextSet))
+            .apply()
+        RimeEngine.redeployFuzzy(context)
+    }
+
+    SectionTitle("模糊拼音")
+    Card {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("启用模糊拼音", fontSize = 17.sp, color = MaterialTheme.colorScheme.onSurface)
+                if (fuzzyOn) {
+                    val sub = if (rimeState == RimeEngine.State.DEPLOYING) "正在编译模糊音词库…"
+                    else "已启用 ${selected.size} 组（支持全拼 / 双拼 / 九宫格）"
+                    Text(sub, fontSize = 12.sp, color = Secondary())
+                }
+            }
+            Switch(
+                checked = fuzzyOn,
+                onCheckedChange = { on ->
+                    val nextSet = if (on && selected.isEmpty()) RimeEngine.COMMON_FUZZY_IDS else selected
+                    applyFuzzy(on, nextSet)
+                },
+                colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF34C759), checkedThumbColor = Color.White),
+            )
+        }
+        if (fuzzyOn) {
+            Divider()
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(
+                    "常用南方模糊音预设",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.clickable { applyFuzzy(true, RimeEngine.COMMON_FUZZY_IDS) },
+                )
+                Text(
+                    "全选",
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable { applyFuzzy(true, RimeEngine.FUZZY_PAIRS.map { it.id }.toSet()) },
+                )
+            }
+            RimeEngine.FUZZY_PAIRS.forEach { pair ->
+                Divider()
+                val checked = pair.id in selected
+                Row(
+                    Modifier.fillMaxWidth().clickable {
+                        val next = if (checked) selected - pair.id else selected + pair.id
+                        applyFuzzy(true, next)
+                    }.padding(horizontal = 16.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "${pair.group} · ${pair.label}",
+                        fontSize = 16.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (checked) {
+                        Text("✓", fontSize = 18.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+    Text(
+        "开启或修改模糊音后会在后台重新生成拼写索引（约数秒），完成后自动生效。",
         fontSize = 13.sp, color = Secondary(), modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 16.dp),
     )
 }

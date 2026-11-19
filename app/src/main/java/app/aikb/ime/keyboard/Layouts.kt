@@ -86,18 +86,31 @@ object Layouts {
                 enter,
             ))
             BottomRow.EMAIL -> Row(listOf(
-                modeKey, emoji,
-                Key(KeyType.SPACE, "space", " ", 3.1f),
-                Key(KeyType.CHAR, "@", "@", 1.25f),
-                Key(KeyType.CHAR, ".", ".", 1.25f, listOf("-", "_")),
-                enter,
+                Key(if (page == Page.LETTERS) KeyType.TO_SYMBOLS else KeyType.TO_LETTERS,
+                    if (page == Page.LETTERS) "123" else if (chinese) (spaceLabel ?: "拼音") else "ABC", width = 1.15f),
+                Key(KeyType.CHAR, "@", "@", 1.05f),
+                Key(KeyType.SPACE, if (chinese) (spaceLabel ?: "空格") else "space", " ", 3.50f),
+                Key(KeyType.CHAR, ".", ".", 1.05f, listOf("-", "_")),
+                Key(KeyType.LANG, "中/英", width = 1.25f),
+                Key(KeyType.ENTER, "", width = 2.00f),
             ))
-            BottomRow.URL -> Row(listOf(
-                modeKey, emoji,
-                Key(KeyType.CHAR, ".", ".", 1.55f, listOf("-", "_", ":")),
-                Key(KeyType.CHAR, "/", "/", 1.55f, listOf("?", "=", "&", "#")),
-                Key(KeyType.TEXT, ".com", ".com", 2.0f, listOf(".cn", ".net", ".org", ".com.cn", ".io")),
-                Key(KeyType.ENTER, "", width = 2.5f),
+            BottomRow.URL -> if (chinese && page == Page.LETTERS) Row(listOf(
+                Key(KeyType.TO_SYMBOLS, "123", width = 1.15f),
+                Key(KeyType.EMOJI, "emoji", width = 1.00f),
+                Key(KeyType.CHAR, "/", "/", 0.85f, listOf("https://", "www.", "?", "=", "&")),
+                Key(KeyType.SPACE, spaceLabel ?: "空格", " ", 3.00f),
+                Key(KeyType.CHAR, ".", ".", 0.85f, listOf(".com", ".cn", ".net", ".org", ":")),
+                Key(KeyType.LANG, "中/英", width = 1.25f),
+                Key(KeyType.ENTER, "", width = 1.90f),
+            )) else Row(listOf(
+                Key(if (page == Page.LETTERS) KeyType.TO_SYMBOLS else KeyType.TO_LETTERS,
+                    if (page == Page.LETTERS) "123" else if (chinese) (spaceLabel ?: "拼音") else "ABC", width = 1.15f),
+                Key(KeyType.CHAR, "/", "/", 0.90f, listOf("https://", "http://", "?", "=", "&")),
+                Key(KeyType.SPACE, if (chinese) "空格" else "space", " ", 3.10f),
+                Key(KeyType.CHAR, ".", ".", 0.90f, listOf(":", "-", "_")),
+                Key(KeyType.TEXT, ".com", ".com", 1.20f, listOf(".cn", ".net", ".org", ".io", "www.")),
+                Key(KeyType.LANG, "中/英", width = 1.20f),
+                Key(KeyType.ENTER, "", width = 1.55f),
             ))
         }
     }
