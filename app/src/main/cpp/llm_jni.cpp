@@ -38,9 +38,67 @@ llama_context* g_ctx = nullptr;
 const llama_vocab* g_vocab = nullptr;
 std::vector<llama_token> g_cached;     // tokens currently in seq 0
 std::vector<float> g_lastLogProbs;     // log-softmax after the last context token
-std::atomic<bool> g_abort{false};     // set from the UI thread when the user keeps typing
+std::vector<uint8_t> g_tokCjkLen;      // 1..6 if token is pure BMP CJK (U+4E00..U+9FFF), else 0
+std::vector<uint8_t> g_tokIsParticle;  // 1 if token is a bare Chinese suffix particle
+std::vector<std::string> g_tokPiece;   // UTF-8 piece for pure-CJK tokens
+std::atomic<bool> g_abort{false};      // set from the UI thread when the user keeps typing
 
 bool abortCallback(void*) { return g_abort.load(); }
+
+void initVocabTables() {
+    const int nVocab = llama_vocab_n_tokens(g_vocab);
+    g_tokCjkLen.assign(nVocab, 0);
+    g_tokIsParticle.assign(nVocab, 0);
+    g_tokPiece.assign(nVocab, std::string());
+    char buf[32];
+    for (int t = 0; t < nVocab; ++t) {
+        if (llama_vocab_is_control(g_vocab, t) || llama_vocab_is_eog(g_vocab, t)) continue;
+        int n = llama_token_to_piece(g_vocab, t, buf, sizeof(buf), 0, false);
+        if (n < 3 || n > 18 || (n % 3) != 0) continue;
+        bool allCjk = true;
+        for (int i = 0; i < n; i += 3) {
+            uint8_t b0 = (uint8_t) buf[i], b1 = (uint8_t) buf[i + 1], b2 = (uint8_t) buf[i + 2];
+            if ((b0 & 0xF0) != 0xE0 || (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) { allCjk = false; break; }
+            uint32_t cp = ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)(b1 & 0x3F) << 6) | (uint32_t)(b2 & 0x3F);
+            if (cp < 0x4E00 || cp > 0x9FFF) { allCjk = false; break; }
+        }
+        if (!allCjk) continue;
+        g_tokCjkLen[t] = (uint8_t) (n / 3);
+        std::string s(buf, n);
+        if (s == "的" || s == "了" || s == "吗" || s == "呢" || s == "吧" ||
+            s == "啊" || s == "着" || s == "过" || s == "地" || s == "得") {
+            g_tokIsParticle[t] = 1;
+        }
+        g_tokPiece[t] = std::move(s);
+    }
+}
+
+jstring toJava(JNIEnv* env, const std::string& utf8) {
+    std::vector<jchar> u16;
+    u16.reserve(utf8.size());
+    size_t i = 0;
+    while (i < utf8.size()) {
+        uint8_t b0 = (uint8_t) utf8[i];
+        uint32_t cp = 0;
+        if (b0 < 0x80) { cp = b0; i += 1; }
+        else if ((b0 & 0xE0) == 0xC0 && i + 1 < utf8.size()) {
+            cp = ((uint32_t)(b0 & 0x1F) << 6) | ((uint32_t) utf8[i + 1] & 0x3F); i += 2;
+        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < utf8.size()) {
+            cp = ((uint32_t)(b0 & 0x0F) << 12) | (((uint32_t) utf8[i + 1] & 0x3F) << 6) | ((uint32_t) utf8[i + 2] & 0x3F); i += 3;
+        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < utf8.size()) {
+            cp = ((uint32_t)(b0 & 0x07) << 18) | (((uint32_t) utf8[i + 1] & 0x3F) << 12) |
+                 (((uint32_t) utf8[i + 2] & 0x3F) << 6) | ((uint32_t) utf8[i + 3] & 0x3F); i += 4;
+        } else { i += 1; continue; }
+        if (cp <= 0xFFFF) {
+            u16.push_back((jchar) cp);
+        } else {
+            cp -= 0x10000;
+            u16.push_back((jchar) (0xD800 + (cp >> 10)));
+            u16.push_back((jchar) (0xDC00 + (cp & 0x3FF)));
+        }
+    }
+    return env->NewString(u16.data(), (jsize) u16.size());
+}
 
 std::vector<llama_token> tokenize(const std::string& s) {
     std::vector<llama_token> out(s.size() + 8);
@@ -155,6 +213,7 @@ JNI_FN(jboolean, nativeLoad)(JNIEnv* env, jobject, jstring path, jint threads) {
     g_ctx = llama_init_from_model(g_model, cp);
     if (!g_ctx) { LOGE("context init failed"); llama_model_free(g_model); g_model = nullptr; return JNI_FALSE; }
     g_vocab = llama_model_get_vocab(g_model);
+    initVocabTables();
     g_cached.clear(); g_lastLogProbs.clear();
     LOGI("model loaded (%d threads, vocab %d) %s", threads, llama_vocab_n_tokens(g_vocab), llama_print_system_info());
     return JNI_TRUE;
@@ -165,6 +224,7 @@ JNI_FN(void, nativeFree)(JNIEnv*, jobject) {
     if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
     if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     g_cached.clear(); g_lastLogProbs.clear();
+    g_tokCjkLen.clear(); g_tokIsParticle.clear(); g_tokPiece.clear();
 }
 
 /** log P(candidate | context) per candidate; null on failure. */
@@ -274,8 +334,125 @@ JNI_FN(jfloatArray, nativeScore)(JNIEnv* env, jobject, jstring context, jobjectA
     return out;
 }
 
-/** Asks a running nativeScore to stop as soon as possible (it then returns null). Lock-free. */
+/** Asks a running nativeScore/nativePredict to stop as soon as possible (it then returns null). Lock-free. */
 JNI_FN(void, nativeAbort)(JNIEnv*, jobject) { g_abort = true; }
+
+/**
+ * Generates up to [maxOut] context-aware multi-character Chinese continuations given the full
+ * sentence [context] before cursor, sharing seq 0 KV cache with nativeScore (~6-12 ms).
+ */
+JNI_FN(jobjectArray, nativePredict)(JNIEnv* env, jobject, jstring context, jint maxOut) {
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (!g_ctx || maxOut <= 0 || g_tokCjkLen.empty()) return nullptr;
+    g_abort = false;
+    std::string rawCtx = fromJava(env, context);
+    if (rawCtx.empty()) return nullptr;
+
+    const double t0 = nowMs();
+    std::vector<llama_token> ctxTok = tokenize("\n" + rawCtx);
+    if ((int) ctxTok.size() > kCtx - 16) ctxTok.erase(ctxTok.begin() + 1, ctxTok.end() - (kCtx - 16 - 1));
+    if (!syncContext(ctxTok) || g_abort.load() || g_lastLogProbs.empty()) return nullptr;
+
+    const int nVocab = (int) g_tokCjkLen.size();
+    struct TokScore { llama_token tok; float lp; };
+    std::vector<TokScore> top1;
+    top1.reserve(10);
+    for (int t = 0; t < nVocab; ++t) {
+        if (g_tokCjkLen[t] == 0) continue;
+        float lp = g_lastLogProbs[t];
+        if (lp < -5.2f) continue;
+        if (top1.size() < 8) {
+            top1.push_back({t, lp});
+            std::sort(top1.begin(), top1.end(), [](const TokScore& a, const TokScore& b) { return a.lp > b.lp; });
+        } else if (lp > top1.back().lp) {
+            top1.back() = {t, lp};
+            std::sort(top1.begin(), top1.end(), [](const TokScore& a, const TokScore& b) { return a.lp > b.lp; });
+        }
+    }
+
+    struct PredCand { std::string text; float score; };
+    std::vector<PredCand> cands;
+    std::vector<TokScore> expand;
+    for (const auto& ts : top1) {
+        uint8_t clen = g_tokCjkLen[ts.tok];
+        if (clen >= 2 && clen <= 4 && ts.lp >= -4.5f) {
+            cands.push_back({g_tokPiece[ts.tok], ts.lp});
+        }
+        if ((int) expand.size() < 4) {
+            if ((clen == 1 && ts.lp >= -4.5f && !g_tokIsParticle[ts.tok]) ||
+                (clen == 2 && ts.lp >= -2.6f)) {
+                expand.push_back(ts);
+            }
+        }
+    }
+
+    if (!expand.empty() && !g_abort.load()) {
+        llama_memory_t mem = llama_get_memory(g_ctx);
+        const llama_pos base = (llama_pos) ctxTok.size();
+        llama_batch batch = llama_batch_init((int) expand.size(), 0, 1);
+        for (size_t b = 0; b < expand.size(); ++b) {
+            llama_memory_seq_cp(mem, 0, (llama_seq_id) (b + 1), 0, base);
+            int k = batch.n_tokens++;
+            batch.token[k] = expand[b].tok;
+            batch.pos[k] = base;
+            batch.n_seq_id[k] = 1;
+            batch.seq_id[k][0] = (llama_seq_id) (b + 1);
+            batch.logits[k] = true;
+        }
+        bool ok = llama_decode(g_ctx, batch) == 0;
+        if (ok && !g_abort.load()) {
+            for (size_t b = 0; b < expand.size(); ++b) {
+                const float* logits = llama_get_logits_ith(g_ctx, (int32_t) b);
+                const float lse = logSumExp(logits, nVocab);
+                const uint8_t len1 = g_tokCjkLen[expand[b].tok];
+                const float lp1 = expand[b].lp;
+                for (int t2 = 0; t2 < nVocab; ++t2) {
+                    uint8_t len2 = g_tokCjkLen[t2];
+                    if (len2 == 0 || g_tokIsParticle[t2]) continue;
+                    float lp2 = logits[t2] - lse;
+                    if (len1 == 1 && (len2 == 1 || len2 == 2) && lp2 >= -3.6f) {
+                        float sc = (lp1 + lp2) / 1.60f;
+                        if (sc >= -4.4f) {
+                            cands.push_back({g_tokPiece[expand[b].tok] + g_tokPiece[t2], sc});
+                        }
+                    } else if (len1 == 2 && len2 == 2 && (lp1 + lp2) >= -4.2f) {
+                        cands.push_back({g_tokPiece[expand[b].tok] + g_tokPiece[t2], (lp1 + lp2) / 1.55f});
+                    }
+                }
+            }
+        }
+        llama_batch_free(batch);
+        for (size_t b = 0; b < expand.size(); ++b) {
+            llama_memory_seq_rm(mem, (llama_seq_id) (b + 1), -1, -1);
+        }
+    }
+
+    if (cands.empty()) return nullptr;
+    std::sort(cands.begin(), cands.end(), [](const PredCand& a, const PredCand& b) { return a.score > b.score; });
+
+    std::vector<std::string> unique;
+    const int cap = std::min<int>(maxOut, 8);
+    for (const auto& c : cands) {
+        bool dup = false;
+        for (const auto& u : unique) {
+            if (u == c.text) { dup = true; break; }
+        }
+        if (!dup) {
+            unique.push_back(c.text);
+            if ((int) unique.size() >= cap) break;
+        }
+    }
+
+    LOGI("predict: ctx %zu tok -> %zu cands in %.1f ms", ctxTok.size(), unique.size(), nowMs() - t0);
+    jclass strCls = env->FindClass("java/lang/String");
+    jobjectArray arr = env->NewObjectArray((jsize) unique.size(), strCls, nullptr);
+    for (size_t i = 0; i < unique.size(); ++i) {
+        jstring js = toJava(env, unique[i]);
+        env->SetObjectArrayElement(arr, (jsize) i, js);
+        env->DeleteLocalRef(js);
+    }
+    return arr;
+}
 
 /** Debug: prefill [nTokens] dummy tokens in a scratch sequence; returns milliseconds. */
 JNI_FN(jdouble, nativeBench)(JNIEnv*, jobject, jint nTokens, jint outputs) {

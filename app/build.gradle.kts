@@ -13,8 +13,8 @@ android {
         applicationId = "app.aikb.ime"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "3.0.0"
+        versionCode = 16
+        versionName = "3.1.0"
         externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=c++_static") } }
     }
 

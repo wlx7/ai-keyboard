@@ -131,6 +131,10 @@ class ImeService : InputMethodService(),
     private var result: EnglishResult? = null
     private var showNextPredictions = false
     private var showZhPredictions = false
+    private var lastCommittedZhWord: String = ""
+    private var lastCommittedZhContext: String = ""
+    private var aiNextPredictions: List<String> = emptyList()
+    private var aiPredictContext: String = ""
     private var shownCandidates: List<String> = emptyList()
     private var candidateCommits: List<String> = emptyList()
     private var panelCommits: List<String> = emptyList()
@@ -149,6 +153,7 @@ class ImeService : InputMethodService(),
         zhChainSchema = ""
         pendingRimePickRank = 0
         zhSessionHadManualPick = false
+        lastCommittedZhWord = ""
         UserZhLexicon.resetConsecutiveTracker()
     }
 
@@ -987,11 +992,11 @@ class ImeService : InputMethodService(),
     }
 
     private fun trailingZhWordBeforeCursor(skipSuffixLen: Int = 0): String? {
-        val raw = currentInputConnection?.getTextBeforeCursor(8 + skipSuffixLen, 0)?.toString() ?: return null
+        val raw = currentInputConnection?.getTextBeforeCursor(12 + skipSuffixLen, 0)?.toString() ?: return null
         val before = if (skipSuffixLen > 0 && raw.length >= skipSuffixLen) raw.dropLast(skipSuffixLen) else raw
         if (before.isEmpty()) return null
         var i = before.length
-        while (i > 0 && ChinesePredictor.isCjk(before[i - 1]) && before.length - i < 4) i--
+        while (i > 0 && ChinesePredictor.isCjk(before[i - 1]) && before.length - i < 7) i--
         return before.substring(i).takeIf { it.isNotEmpty() }
     }
 
@@ -1013,9 +1018,28 @@ class ImeService : InputMethodService(),
 
     private fun recordChineseCommit(prevZh: String?, committed: String) {
         AiRanker.remember(committed)
-        if (scene.learn) zhPredictor?.learn(prevZh, committed)
+        if (scene.learn) {
+            zhPredictor?.learn(prevZh, committed)
+            if (lastCommittedZhWord.isNotEmpty() && lastCommittedZhWord != prevZh &&
+                prevZh?.endsWith(lastCommittedZhWord) == true
+            ) {
+                zhPredictor?.learn(lastCommittedZhWord, committed)
+            }
+        }
+        lastCommittedZhWord = if (committed.isNotEmpty() && committed.all(ChinesePredictor::isCjk)) committed else ""
+        val rawCtx = currentInputConnection?.getTextBeforeCursor(48, 0)?.toString().orEmpty()
+        lastCommittedZhContext = when {
+            committed.isEmpty() -> rawCtx
+            rawCtx.endsWith(committed) -> rawCtx
+            else -> (rawCtx + committed).takeLast(48)
+        }
+        aiNextPredictions = emptyList()
+        aiPredictContext = ""
         showZhPredictions = kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD &&
             committed.isNotEmpty() && ChinesePredictor.isCjk(committed.last())
+        if (showZhPredictions && !zhComposing) {
+            scheduleAiPredict(lastCommittedZhContext)
+        }
     }
 
     // ------------------------------------------------------------------ Haptics & keyboard callbacks
@@ -1083,7 +1107,19 @@ class ImeService : InputMethodService(),
             commitFormatted(ic, text)
             resetZhLearningChain()
             showNextPredictions = false
-            showZhPredictions = false
+            if (chinese && text in setOf("，", "、") && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD) {
+                AiRanker.remember(text)
+                val rawBefore = ic.getTextBeforeCursor(48, 0)?.toString().orEmpty()
+                val fullCtx = if (rawBefore.endsWith(text)) rawBefore else (rawBefore + text).takeLast(48)
+                lastCommittedZhContext = fullCtx
+                aiNextPredictions = emptyList()
+                aiPredictContext = ""
+                showZhPredictions = fullCtx.dropLast(text.length).any(ChinesePredictor::isCjk)
+                if (showZhPredictions) scheduleAiPredict(fullCtx)
+            } else {
+                showZhPredictions = false
+                if (text.isNotEmpty() && text.length <= 2) AiRanker.remember(text)
+            }
             if (shift == ShiftState.ONCE && page == Page.LETTERS) setShift(ShiftState.OFF)
             if (text.length == 1 && text[0] in ".?!。？！") updateAutoShift()
         }
@@ -1558,21 +1594,49 @@ class ImeService : InputMethodService(),
                 keepToolbarEdges = labels.isNotEmpty()
             }
             chinese && showZhPredictions && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD && overlay == Overlay.NONE -> {
-                val before = currentInputConnection?.getTextBeforeCursor(8, 0)?.toString().orEmpty()
+                val icBefore = currentInputConnection?.getTextBeforeCursor(48, 0)?.toString().orEmpty()
+                val before = if (icBefore.isNotEmpty() && (lastCommittedZhContext.isEmpty() || icBefore.last() == lastCommittedZhContext.last())) {
+                    icBefore
+                } else {
+                    lastCommittedZhContext.ifEmpty { icBefore }
+                }
                 val emojis = EmojiPredictor.predictForChinese(before)
+                val hasLongCouplet = zhPredictor?.hasLongExactMatch(before, minHeadLen = 4) == true
                 var nexts = zhPredictor?.predict(before, max = 8).orEmpty()
-                if (RimeEngine.traditional && nexts.isNotEmpty()) {
-                    nexts = nexts.map { HandwritingEngine.toTraditional(this, it) }.distinct()
+                var aiNexts = if (before.isNotEmpty() && aiPredictContext.isNotEmpty() &&
+                    (aiPredictContext == before || before.endsWith(aiPredictContext.takeLast(minOf(6, aiPredictContext.length))))
+                ) {
+                    aiNextPredictions
+                } else {
+                    emptyList()
+                }
+                if (RimeEngine.traditional) {
+                    if (nexts.isNotEmpty()) nexts = nexts.map { HandwritingEngine.toTraditional(this, it) }.distinct()
+                    if (aiNexts.isNotEmpty()) aiNexts = aiNexts.map { HandwritingEngine.toTraditional(this, it) }.distinct()
                 }
                 emojis.firstOrNull()?.let { labels += it; commits += it }
-                nexts.forEachIndexed { idx, w ->
-                    if (w !in commits) { labels += w; commits += w }
-                    if (idx == 0 && emojis.size > 1 && emojis[1] !in commits) {
-                        labels += emojis[1]; commits += emojis[1]
+                if (hasLongCouplet && nexts.isNotEmpty()) {
+                    val topCouplet = nexts[0]
+                    if (topCouplet !in commits) { labels += topCouplet; commits += topCouplet }
+                    aiNexts.forEach { w ->
+                        if (w !in commits) { labels += "✦ $w"; commits += w }
+                    }
+                    for (idx in 1 until nexts.size) {
+                        val w = nexts[idx]
+                        if (w !in commits) { labels += w; commits += w }
+                    }
+                } else {
+                    aiNexts.forEach { w ->
+                        if (w !in commits) { labels += "✦ $w"; commits += w }
+                    }
+                    nexts.forEach { w ->
+                        if (w !in commits) { labels += w; commits += w }
                     }
                 }
-                if (nexts.isEmpty() && emojis.size > 1 && emojis[1] !in commits) {
-                    labels += emojis[1]; commits += emojis[1]
+                if (emojis.size > 1 && emojis[1] !in commits) {
+                    val ins = minOf(2, labels.size)
+                    labels.add(ins, emojis[1])
+                    commits.add(ins, emojis[1])
                 }
                 keepToolbarEdges = labels.isNotEmpty()
             }
@@ -1634,6 +1698,7 @@ class ImeService : InputMethodService(),
             .getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return
         triggerHaptic()
         var removed = UserZhLexicon.forget(word)
+        if (zhPredictor?.forgetWord(word) == true) removed = true
         val pdMatches = PersonalDictionary.allEntries(this).filter { it.word.equals(word, ignoreCase = true) }
         if (pdMatches.isNotEmpty()) {
             pdMatches.forEach { PersonalDictionary.remove(this, it) }
@@ -1863,11 +1928,62 @@ class ImeService : InputMethodService(),
 
     private fun aiEnabled(): Boolean = prefs.getBoolean(KEY_AI, true) && AiRanker.hasModel(this)
 
-    private fun scheduleAi() {
+    private var aiScheduledPredictCtx: String = ""
+
+    private fun scheduleAiPredict(explicitCtx: String = "") {
+        if (zhComposing || !showZhPredictions || !aiEnabled() || !kbPrefs.postCommitPredict) return
+        val ctx = explicitCtx.ifEmpty {
+            currentInputConnection?.getTextBeforeCursor(48, 0)?.toString().orEmpty()
+                .ifEmpty { lastCommittedZhContext }
+        }.takeLast(48)
+        if (ctx.length < 2) return
+        if (aiScheduledPredictCtx == ctx && aiPending != null) return
         aiPending?.let { aiHandler.removeCallbacks(it) }
         val gen = aiGeneration.incrementAndGet()
         AiRanker.abort()
-        if (!zhComposing || !aiEnabled()) return
+        aiScheduledPredictCtx = ctx
+        val job = Runnable {
+            aiPending = null
+            aiWorker.execute {
+                try {
+                    if (gen != aiGeneration.get() || !AiRanker.ensureLoaded(applicationContext)) return@execute
+                    val res = AiRanker.predictNext(ctx, max = 2) { gen != aiGeneration.get() }
+                    if (res.isEmpty() || gen != aiGeneration.get()) return@execute
+                    aiHandler.post {
+                        if (gen == aiGeneration.get() && !zhComposing && showZhPredictions) {
+                            aiNextPredictions = res
+                            aiPredictContext = ctx
+                            updateCandidates()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    android.util.Log.e("ImeService", "AI next-word prediction failed", t)
+                }
+            }
+        }
+        aiPending = job
+        aiHandler.postDelayed(job, 15L)
+    }
+
+    private fun scheduleAi() {
+        if (!zhComposing) {
+            if (showZhPredictions) {
+                scheduleAiPredict(lastCommittedZhContext)
+            } else {
+                aiPending?.let { aiHandler.removeCallbacks(it) }
+                aiPending = null
+                aiScheduledPredictCtx = ""
+                aiGeneration.incrementAndGet()
+                AiRanker.abort()
+            }
+            return
+        }
+        aiPending?.let { aiHandler.removeCallbacks(it) }
+        aiPending = null
+        aiScheduledPredictCtx = ""
+        val gen = aiGeneration.incrementAndGet()
+        AiRanker.abort()
+        if (!aiEnabled()) return
         val schema = RimeEngine.currentSchema() ?: return
         if (!AiRanker.supports(schema)) return
         val shown = zhDisplay()
@@ -2056,8 +2172,19 @@ class ImeService : InputMethodService(),
     override fun onHandwritingPunct(punct: String) {
         triggerHaptic()
         if (hwComposing) hwCommitTop()
-        showZhPredictions = false
         currentInputConnection?.commitText(punct, 1)
+        if (punct in setOf("，", "、") && kbPrefs.postCommitPredict && scene.suggestions && scene.kind != FieldKind.PASSWORD) {
+            AiRanker.remember(punct)
+            val rawBefore = currentInputConnection?.getTextBeforeCursor(48, 0)?.toString().orEmpty()
+            val fullCtx = if (rawBefore.endsWith(punct)) rawBefore else (rawBefore + punct).takeLast(48)
+            lastCommittedZhContext = fullCtx
+            aiNextPredictions = emptyList()
+            aiPredictContext = ""
+            showZhPredictions = fullCtx.dropLast(punct.length).any(ChinesePredictor::isCjk)
+            if (showZhPredictions) scheduleAiPredict(fullCtx)
+        } else {
+            showZhPredictions = false
+        }
         updateCandidates()
     }
 
@@ -2134,8 +2261,7 @@ class ImeService : InputMethodService(),
             input.forEach { RimeEngine.processKey(it.code) }
             zhSync()
         } else {
-            if (zhComposing) zhCommitTop()
-            currentInputConnection?.commitText(item, 1)
+            onText(Key(KeyType.TEXT, item), item)
         }
     }
 

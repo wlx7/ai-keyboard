@@ -12,4 +12,6 @@ object Llm {
     @JvmStatic external fun nativeBench(nTokens: Int, outputs: Int): Double
     /** log P(candidate | context) for each candidate, or null on failure. */
     @JvmStatic external fun nativeScore(context: String, candidates: Array<String>): FloatArray?
+    /** Generates up to [maxOut] context-aware CJK continuations given [context], sharing KV cache. */
+    @JvmStatic external fun nativePredict(context: String, maxOut: Int): Array<String>?
 }

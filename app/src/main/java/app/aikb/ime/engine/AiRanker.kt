@@ -285,6 +285,52 @@ object AiRanker {
         return Suggestion(alts[top], second, alts)
     }
 
+    /**
+     * Generates up to [max] full-sentence context-aware Chinese next-word predictions (`输入后联想`)
+     * using `Keylo-285M v2` (~6-12 ms off UI thread, sharing seq 0 KV cache with [suggest]).
+     */
+    fun predictNext(
+        context: String,
+        max: Int = 2,
+        stale: () -> Boolean = { false },
+    ): List<String> {
+        if (!loaded || max <= 0 || !hasCjkContext(context)) return emptyList()
+        val ctx = context.takeLast(48).trimStart()
+        if (ctx.codePointCount(0, ctx.length) < 2) return emptyList()
+        val raw = Llm.nativePredict(ctx, 6) ?: return emptyList()
+        if (stale() || raw.isEmpty()) return emptyList()
+        return filterAiNextPredictions(ctx, raw.asList(), max)
+    }
+
+    internal fun filterAiNextPredictions(
+        ctx: String,
+        raw: List<String>,
+        max: Int = 2,
+    ): List<String> {
+        val recentTail = ctx.takeLast(12)
+        val out = ArrayList<String>(max)
+        for (cand in raw) {
+            val cpLen = cand.codePointCount(0, cand.length)
+            if (cpLen !in 2..4) continue
+            if (cand in recentTail) continue
+            if (ctx.isNotEmpty() && ctx.last() == cand.first() && cand[0] != cand.getOrNull(1)) continue
+            if (out.any { cand.startsWith(it) || it.startsWith(cand) }) continue
+            if (HanziPinyin.isLoaded) {
+                var rare = false
+                var idx = 0
+                while (idx < cand.length) {
+                    val cp = cand.codePointAt(idx)
+                    idx += Character.charCount(cp)
+                    if (HanziPinyin.charWeight(cp) < 1500) { rare = true; break }
+                }
+                if (rare) continue
+            }
+            out += cand
+            if (out.size >= max) break
+        }
+        return out
+    }
+
     // ------------------------------------------------------------ adaptation
 
     /** Called when the user picks a candidate while the AI had reordered (aiTop != rimeTop). */

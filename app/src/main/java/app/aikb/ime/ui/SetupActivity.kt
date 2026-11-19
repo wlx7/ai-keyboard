@@ -350,7 +350,7 @@ class SetupActivity : ComponentActivity() {
                             .background(Color.White.copy(alpha = 0.2f))
                             .padding(horizontal = 9.dp, vertical = 2.dp),
                     ) {
-                        Text("v3.0 Hybrid Octagram + LLM", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+                        Text("v3.1 Hybrid Octagram + LLM", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
